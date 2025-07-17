@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+openai
+twilio
+apscheduler
+reportlab
+sqlalchemy>=1.4
+asyncpg
+aiosqlite
