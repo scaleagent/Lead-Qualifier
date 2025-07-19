@@ -1,20 +1,26 @@
-import os
-import sys
+import os, sys
 from logging.config import fileConfig
 from dotenv import load_dotenv
-
 from sqlalchemy import engine_from_config, pool
 from alembic import context
 
-# 1) Load environment variables from .env (locally) or Heroku’s env
-load_dotenv()
-
-# 2) Ensure your project root is on Python path so we can import your models
+# 0) Ensure our app’s folder is on the path so we can import repos.models
+#    (needed if Alembic isn’t already running with your project root on PYTHONPATH)
 sys.path.insert(0, os.getcwd())
 
-# 3) Tell Alembic where to find its own config and override the DB URL
+# 1) Load .env (local) or Heroku env vars
+load_dotenv()
+
+# 2) Grab DATABASE_URL and patch legacy scheme
+raw_url = os.getenv("DATABASE_URL", "")
+if raw_url.startswith("postgres://"):
+    fixed_url = raw_url.replace("postgres://", "postgresql://", 1)
+else:
+    fixed_url = raw_url
+
+# 3) Override the URL in Alembic’s config
 config = context.config
-config.set_main_option("sqlalchemy.url", os.getenv("DATABASE_URL"))
+config.set_main_option("sqlalchemy.url", fixed_url)
 
 # 4) Set up logging per alembic.ini
 if config.config_file_name is not None:
