@@ -198,7 +198,7 @@ async def sms_webhook(
                                       receiver=From,
                                       body=f"Marked '{job}' as handed over.",
                                       direction="outbound")
-        return "OK"
+        #return "OK"
 
     # 3) Fetch or start conversation
     convo = await conv_repo.get_active_conversation(contractor_phone=To,
@@ -227,7 +227,7 @@ async def sms_webhook(
                                       body=followup,
                                       direction="outbound")
         send_sms(From, followup)
-        return "OK"
+        #return "OK"
 
     # 6) Full history for extraction
     full = await msg_repo.get_all_conversation_messages(convo.id)
@@ -258,7 +258,7 @@ async def sms_webhook(
                                       body=ask,
                                       direction="outbound")
         send_sms(From, ask)
-        return "OK"
+        #return "OK"
 
     # 9) (Future) Confirmation and post‐qualification follow-up go here
 
@@ -270,7 +270,7 @@ async def sms_webhook(
                                   direction="outbound")
     send_sms(From, reply)
 
-    return "OK"
+    #return "OK"
 
 
 # === PDF Generation Endpoint ===
