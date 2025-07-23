@@ -28,6 +28,16 @@ twilio_client = Client(os.environ.get("TWILIO_ACCOUNT_SID", ""),
 TWILIO_NUMBER = os.environ.get("TWILIO_PHONE_NUMBER", "")
 DIGEST_TEST_RECEIVER = os.environ.get("DIGEST_TEST_RECEIVER")
 
+# === Qualification Schema ===
+# We prompt for these five fields, two at a time.
+REQUIRED_FIELDS = [
+    "job_type",
+    "property_type",
+    "urgency",
+    "address",
+    "access",
+]
+
 # === AI / SMS Utility Functions ===
 
 
@@ -72,24 +82,21 @@ async def classify_message(message_text: str, history_string: str) -> str:
 
 async def extract_qualification_data(history_string: str) -> dict:
     """
-    Extract structured qualification fields from conversation history
-    using the following JSON schema:
-    {
-      "job_type": "...",
-      "property_type": "...",
-      "urgency": "...",
-      "address": "...",
-      "access": "...",
-      "notes": "..."
-    }
-    Always return valid JSON with empty strings for missing values.
+    Extract structured qualification fields from conversation history.
+    Always return all six keys, defaulting to empty string.
     """
     system_prompt = (
-        "You are an assistant that extracts customer-provided job details. "
-        "Analyze the conversation history and output *only* a JSON object with these keys: "
-        "job_type, property_type, urgency, address, access, notes. "
-        "The 'notes' field should contain any extra information or stray text. "
-        "For keys the customer hasn't provided, use an empty string.")
+        "You are an assistant extracting exactly these fields from the conversation:\n"
+        "  job_type, property_type, urgency, address, access, notes\n"
+        "Respond ONLY with JSON, for example:\n"
+        "{\n"
+        '  "job_type": "Electrical repair",\n'
+        '  "property_type": "House",\n'
+        '  "urgency": "ASAP",\n'
+        '  "address": "123 Main St",\n'
+        '  "access": "Key under mat",\n'
+        '  "notes": "Customer has dog on premises"\n'
+        "}")
     messages = [{
         "role": "system",
         "content": system_prompt
@@ -100,28 +107,14 @@ async def extract_qualification_data(history_string: str) -> dict:
     response = openai.chat.completions.create(model="gpt-3.5-turbo",
                                               messages=messages,
                                               max_tokens=300)
-    content = response.choices[0].message.content.strip()
     try:
-        data = json.loads(content)
+        data = json.loads(response.choices[0].message.content)
     except json.JSONDecodeError:
-        print("❌ Failed to parse JSON from extract_qualification_data:",
-              content)
-        # Fallback: return empty schema
-        data = {
-            "job_type": "",
-            "property_type": "",
-            "urgency": "",
-            "address": "",
-            "access": "",
-            "notes": ""
-        }
+        data = {}
+
     # Ensure all keys exist
-    for key in [
-            "job_type", "property_type", "urgency", "address", "access",
-            "notes"
-    ]:
-        if key not in data:
-            data[key] = ""
+    for key in REQUIRED_FIELDS + ["notes"]:
+        data.setdefault(key, "")
     return data
 
 
@@ -129,14 +122,12 @@ def is_qualified(data: dict) -> bool:
     """
     Check if all required qualification fields are present.
     """
-    return all(
-        data.get(k)
-        for k in ["job_type", "property_type", "urgency", "address", "access"])
+    return all(data.get(k) for k in REQUIRED_FIELDS)
 
 
 async def generate_reply(chat_messages: list) -> str:
     """
-    Generate an AI assistant reply given chat messages.
+    Generate a free-form AI assistant reply given chat messages.
     """
     response = openai.chat.completions.create(model="gpt-3.5-turbo",
                                               messages=chat_messages,
@@ -216,7 +207,7 @@ async def sms_webhook(
         convo = await conv_repo.create_conversation(contractor_phone=To,
                                                     customer_phone=From)
 
-    # 4) Get recent history
+    # 4) Get recent history for classification
     recent = await msg_repo.get_recent_messages(customer=From,
                                                 contractor=To,
                                                 limit=10)
@@ -230,32 +221,48 @@ async def sms_webhook(
         convo = await conv_repo.create_conversation(contractor_phone=To,
                                                     customer_phone=From)
     elif classification == "UNSURE":
-        await msg_repo.create_message(
-            sender=To,
-            receiver=From,
-            body="Hi! Is this about your previous job or a new one?",
-            direction="outbound")
-        send_sms(From, "Hi! Is this about your previous job or a new one?")
+        followup = "Hi! Is this about your previous job or a new one?"
+        await msg_repo.create_message(sender=To,
+                                      receiver=From,
+                                      body=followup,
+                                      direction="outbound")
+        send_sms(From, followup)
         return "OK"
 
-    # 6) Extract data with new schema
+    # 6) Full history for extraction
     full = await msg_repo.get_all_conversation_messages(convo.id)
     full_hist = "\n".join(f"{'Customer' if d=='inbound' else 'AI'}: {b}"
                           for d, b in full)
-    data = await extract_qualification_data(full_hist)
-    qualified = is_qualified(data)
 
-    # 7) Upsert qualification data
+    # 7) Extract & upsert qualification data
+    data = await extract_qualification_data(full_hist)
+    qualified_flag = is_qualified(data)
     await data_repo.upsert(
         conversation_id=convo.id,
         contractor_phone=To,
         customer_phone=From,
         data_dict=data,
-        qualified=qualified,
-        job_title=data.get("job_type", "")  # placeholder
+        qualified=qualified_flag,
+        job_title=data.get("job_type")  # temporary
     )
 
-    # 8) Generate AI reply & respond
+    # 8) Two-fields-per-message prompt
+    missing = [k for k in REQUIRED_FIELDS if not data.get(k)]
+    if missing:
+        next_two = missing[:2]
+        # humanize field names
+        labels = [f.replace("_", " ") for f in next_two]
+        ask = f"Please provide your {labels[0]} and {labels[1]}."
+        await msg_repo.create_message(sender=To,
+                                      receiver=From,
+                                      body=ask,
+                                      direction="outbound")
+        send_sms(From, ask)
+        return "OK"
+
+    # 9) (Future) Confirmation and post‐qualification follow-up go here
+
+    # 10) Default: free-form AI reply
     reply = await generate_reply(build_chat_messages(full))
     await msg_repo.create_message(sender=To,
                                   receiver=From,
@@ -286,33 +293,25 @@ async def run_daily_digest():
     today = datetime.utcnow().strftime("%d/%m")
     for contractor, leads in per_contractor.items():
         lines = [f"📊 TODAY'S LEADS ({today})"]
-
         complete = [l for l in leads if l.qualified]
         if complete:
             lines.append("✅ Complete:")
             for l in complete:
                 d = l.data_json
-                pdf_url = f"https://{os.environ.get('REPLIT_DOMAIN')}/pdf/{l.conversation_id}"
+                pdf_url = f"https://{os.environ['REPLIT_DOMAIN']}/pdf/{l.conversation_id}"
                 lines.append(
-                    f"- {d.get('job_type','')} | {d.get('address','')} | {d.get('property_type','')} | View: {pdf_url}"
+                    f"- {d.get('job_type','')} | {d.get('property_type','')} | {d.get('urgency','')} | {d.get('address','')}\n  View: {pdf_url}"
                 )
-
         incomplete = [l for l in leads if not l.qualified]
         if incomplete:
             lines.append("⏸️ Incomplete:")
             for l in incomplete:
                 d = l.data_json
-                missing = [
-                    k for k in [
-                        "job_type", "property_type", "urgency", "address",
-                        "access"
-                    ] if not d.get(k)
-                ]
+                missing = [k for k in REQUIRED_FIELDS if not d.get(k)]
                 last = l.last_updated.strftime("%d/%m %H:%M")
                 lines.append(
-                    f"- {d.get('job_type','')} ({l.customer_phone}), last update {last}. Missing: {', '.join(missing)}"
-                )
-
+                    f"- {d.get('job_type','')} ({l.customer_phone}), last update {last}\n"
+                    f"  Missing: {', '.join(missing)}")
         body = "\n".join(lines)
         send_sms(contractor, body)
 
