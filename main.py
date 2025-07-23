@@ -19,7 +19,6 @@ from repos.conversation_repo import ConversationRepo
 from repos.message_repo import MessageRepo
 from repos.conversation_data_repo import ConversationDataRepo
 
-
 app = FastAPI()
 
 # === External API Clients ===
@@ -73,25 +72,57 @@ async def classify_message(message_text: str, history_string: str) -> str:
 
 async def extract_qualification_data(history_string: str) -> dict:
     """
-    Extract structured qualification fields from conversation history.
+    Extract structured qualification fields from conversation history
+    using the following JSON schema:
+    {
+      "job_type": "...",
+      "property_type": "...",
+      "urgency": "...",
+      "address": "...",
+      "access": "...",
+      "notes": "..."
+    }
+    Always return valid JSON with empty strings for missing values.
     """
+    system_prompt = (
+        "You are an assistant that extracts customer-provided job details. "
+        "Analyze the conversation history and output *only* a JSON object with these keys: "
+        "job_type, property_type, urgency, address, access, notes. "
+        "The 'notes' field should contain any extra information or stray text. "
+        "For keys the customer hasn't provided, use an empty string.")
     messages = [{
-        "role":
-        "system",
-        "content":
-        ("Extract job details. Return JSON with job_type, urgency, timeline, "
-         "property_type, name, notes, and a short job_title.")
+        "role": "system",
+        "content": system_prompt
     }, {
         "role": "user",
         "content": f"Conversation:\n{history_string}"
     }]
     response = openai.chat.completions.create(model="gpt-3.5-turbo",
                                               messages=messages,
-                                              max_tokens=200)
+                                              max_tokens=300)
+    content = response.choices[0].message.content.strip()
     try:
-        return json.loads(response.choices[0].message.content)
+        data = json.loads(content)
     except json.JSONDecodeError:
-        return {}
+        print("❌ Failed to parse JSON from extract_qualification_data:",
+              content)
+        # Fallback: return empty schema
+        data = {
+            "job_type": "",
+            "property_type": "",
+            "urgency": "",
+            "address": "",
+            "access": "",
+            "notes": ""
+        }
+    # Ensure all keys exist
+    for key in [
+            "job_type", "property_type", "urgency", "address", "access",
+            "notes"
+    ]:
+        if key not in data:
+            data[key] = ""
+    return data
 
 
 def is_qualified(data: dict) -> bool:
@@ -100,7 +131,7 @@ def is_qualified(data: dict) -> bool:
     """
     return all(
         data.get(k)
-        for k in ["job_type", "urgency", "timeline", "property_type"])
+        for k in ["job_type", "property_type", "urgency", "address", "access"])
 
 
 async def generate_reply(chat_messages: list) -> str:
@@ -141,9 +172,6 @@ async def on_startup():
 # === Health-check endpoint ===
 @app.get("/", response_class=PlainTextResponse)
 def read_root():
-    """
-    Simple root endpoint so GET / returns 200 OK.
-    """
     return "✅ SMS-Lead-Qual API is running."
 
 
@@ -161,16 +189,6 @@ async def sms_webhook(
         Body: str = Form(...),
         session=Depends(get_session),
 ):
-    """
-    Handles incoming SMS via Twilio webhook:
-     1) Logs inbound message
-     2) Processes “[CONTACTED ...]” commands
-     3) Finds or creates a conversation
-     4) Classifies new vs continuation
-     5) Extracts qualification data
-     6) Upserts conversation_data
-     7) Generates & sends AI reply
-    """
     conv_repo = ConversationRepo(session)
     msg_repo = MessageRepo(session)
     data_repo = ConversationDataRepo(session)
@@ -189,7 +207,7 @@ async def sms_webhook(
                                       receiver=From,
                                       body=f"Marked '{job}' as handed over.",
                                       direction="outbound")
-        #return "OK"
+        return "OK"
 
     # 3) Fetch or start conversation
     convo = await conv_repo.get_active_conversation(contractor_phone=To,
@@ -217,9 +235,10 @@ async def sms_webhook(
             receiver=From,
             body="Hi! Is this about your previous job or a new one?",
             direction="outbound")
-        #return "OK"
+        send_sms(From, "Hi! Is this about your previous job or a new one?")
+        return "OK"
 
-    # 6) Extract data
+    # 6) Extract data with new schema
     full = await msg_repo.get_all_conversation_messages(convo.id)
     full_hist = "\n".join(f"{'Customer' if d=='inbound' else 'AI'}: {b}"
                           for d, b in full)
@@ -233,7 +252,7 @@ async def sms_webhook(
         customer_phone=From,
         data_dict=data,
         qualified=qualified,
-        job_title=data.get("job_title"),
+        job_title=data.get("job_type", "")  # placeholder
     )
 
     # 8) Generate AI reply & respond
@@ -250,62 +269,50 @@ async def sms_webhook(
 # === PDF Generation Endpoint ===
 @app.get("/pdf/{convo_id}")
 def generate_pdf(convo_id: str):
-    """
-    Generate a PDF of the full conversation history.
-    """
     path = f"/tmp/{convo_id}.pdf"
     return FileResponse(path, media_type="application/pdf")
 
 
-# === Daily Digest Task (TODO) ===
+# === Daily Digest Task ===
 async def run_daily_digest():
-    """
-    Gather all leads, group by contractor, format a SMS digest,
-    and send via Twilio at 18:00 each day.
-    """
-    # 1) Spin up a short-lived DB session
     async with AsyncSessionLocal() as session:
         data_repo = ConversationDataRepo(session)
         all_leads = await data_repo.get_all()
 
-    # 2) Group by contractor_phone
     per_contractor: dict[str, list] = {}
     for lead in all_leads:
         per_contractor.setdefault(lead.contractor_phone, []).append(lead)
 
-    # 3) Build & send one digest per contractor
     today = datetime.utcnow().strftime("%d/%m")
     for contractor, leads in per_contractor.items():
         lines = [f"📊 TODAY'S LEADS ({today})"]
 
-        # — Complete leads
         complete = [l for l in leads if l.qualified]
         if complete:
             lines.append("✅ Complete:")
             for l in complete:
                 d = l.data_json
-                # PDF link (needs REPLIT_DOMAIN env var set for your host)
-                pdf_url = f"https://{os.environ['REPLIT_DOMAIN']}/pdf/{l.conversation_id}"
+                pdf_url = f"https://{os.environ.get('REPLIT_DOMAIN')}/pdf/{l.conversation_id}"
                 lines.append(
-                    f"- {d.get('name','')} ({l.customer_phone}): {d.get('job_type','')} | "
-                    f"{d.get('timeline','')} | {d.get('property_type','')}\n  View: {pdf_url}"
+                    f"- {d.get('job_type','')} | {d.get('address','')} | {d.get('property_type','')} | View: {pdf_url}"
                 )
 
-        # — Incomplete leads
         incomplete = [l for l in leads if not l.qualified]
         if incomplete:
             lines.append("⏸️ Incomplete:")
             for l in incomplete:
                 d = l.data_json
-                # find which fields are missing
-                missing = [k for k in ["job_type","urgency","timeline","property_type"] if not d.get(k)]
+                missing = [
+                    k for k in [
+                        "job_type", "property_type", "urgency", "address",
+                        "access"
+                    ] if not d.get(k)
+                ]
                 last = l.last_updated.strftime("%d/%m %H:%M")
                 lines.append(
-                    f"- {d.get('name','')} ({l.customer_phone}), last update {last}\n"
-                    f"  Missing: {', '.join(missing)}"
+                    f"- {d.get('job_type','')} ({l.customer_phone}), last update {last}. Missing: {', '.join(missing)}"
                 )
 
-        # 4) Send the SMS
         body = "\n".join(lines)
         send_sms(contractor, body)
 
