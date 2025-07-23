@@ -5,7 +5,7 @@ hidden = [".pythonlibs"]
 
 [nix]
 channel = "stable-24_05"
-packages = ["sqlite"]
+packages = ["openssh", "sqlite"]
 
 [deployment]
 run = ["uvicorn", "main:app", "--host", "0.0.0.0"]
