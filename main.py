@@ -2,7 +2,6 @@ import os
 import json
 import traceback
 import asyncio
-import uuid
 from datetime import datetime
 
 from fastapi import FastAPI, Depends, Form
@@ -26,7 +25,6 @@ openai = OpenAI(api_key=os.environ.get("OPENAI_API_KEY", ""))
 twilio_client = Client(os.environ.get("TWILIO_ACCOUNT_SID", ""),
                        os.environ.get("TWILIO_AUTH_TOKEN", ""))
 TWILIO_NUMBER = os.environ.get("TWILIO_PHONE_NUMBER", "")
-DIGEST_TEST_RECEIVER = os.environ.get("DIGEST_TEST_RECEIVER")
 
 # === Qualification Schema ===
 REQUIRED_FIELDS = [
@@ -37,13 +35,8 @@ REQUIRED_FIELDS = [
     "access",
 ]
 
-# === AI / SMS Utility Functions ===
-
 
 def send_sms(to_number: str, message: str):
-    """
-    Send SMS via Twilio and log errors.
-    """
     try:
         msg = twilio_client.messages.create(body=message,
                                             from_=TWILIO_NUMBER,
@@ -55,36 +48,38 @@ def send_sms(to_number: str, message: str):
 
 
 async def classify_message(message_text: str, history_string: str) -> str:
-    """
-    Classify whether a message starts a new job, continues an existing one, or is unclear.
-    """
-    messages = [{
-        "role":
-        "system",
-        "content":
-        ("You're an AI assistant for a trades business. Classify messages as:\n"
-         "- NEW: a new job request\n"
-         "- CONTINUATION: same job\n"
-         "- UNSURE: unclear\n"
-         "If the new message mentions a new location, job, or type, classify as NEW."
-         )
-    }, {
-        "role":
-        "user",
-        "content":
-        f"Message:\n{message_text}\n\nHistory:\n{history_string}"
-    }]
-    response = openai.chat.completions.create(model="gpt-3.5-turbo",
-                                              messages=messages,
-                                              max_tokens=50)
+    """Classify only when starting a fresh conversation."""
+    messages = [
+        {
+            "role":
+            "system",
+            "content":
+            ("You're an AI assistant for a trades business. Classify messages as:\n"
+             "- NEW: a new job request\n"
+             "- CONTINUATION: same job\n"
+             "- UNSURE: unclear\n"
+             "If the new message mentions a new location, job, or type, classify as NEW."
+             ),
+        },
+        {
+            "role": "user",
+            "content":
+            f"Message:\n{message_text}\n\nHistory:\n{history_string}",
+        },
+    ]
+    response = openai.chat.completions.create(
+        model="gpt-3.5-turbo",
+        messages=messages,
+        temperature=0,
+        top_p=1,
+        max_tokens=50,
+    )
     return response.choices[0].message.content.strip().upper()
 
 
 async def extract_qualification_data(history_string: str) -> dict:
     """
-    Extract structured qualification fields from the conversation history.
-    Only populate if explicitly mentioned; otherwise leave empty.
-    Notes collects any extra customer info.
+    Extract exactly the six keys, with no guessing.
     """
     system_prompt = (
         "Extract exactly these fields from the conversation, based only on what the CUSTOMER explicitly said.\n"
@@ -93,62 +88,35 @@ async def extract_qualification_data(history_string: str) -> dict:
         "- Do NOT guess or infer anything not explicitly provided.\n"
         "- Put any other customer comments into 'notes'.\n"
         "Respond ONLY with a JSON object with these six keys.")
-    messages = [{
-        "role": "system",
-        "content": system_prompt
-    }, {
-        "role": "user",
-        "content": f"Conversation:\n{history_string}"
-    }]
-    response = openai.chat.completions.create(model="gpt-3.5-turbo",
-                                              messages=messages,
-                                              max_tokens=300)
+    messages = [
+        {
+            "role": "system",
+            "content": system_prompt
+        },
+        {
+            "role": "user",
+            "content": f"Conversation:\n{history_string}"
+        },
+    ]
+    response = openai.chat.completions.create(
+        model="gpt-3.5-turbo",
+        messages=messages,
+        temperature=0,
+        top_p=1,
+        max_tokens=300,
+    )
     try:
         data = json.loads(response.choices[0].message.content)
     except json.JSONDecodeError:
-        print("❗️ JSON parse error in extract_qualification_data:",
-              response.choices[0].message.content)
+        print("❗️ JSON parse error:", response.choices[0].message.content)
         data = {}
-
-    # Ensure all keys exist
     for key in REQUIRED_FIELDS + ["notes"]:
         data.setdefault(key, "")
     return data
 
 
 def is_qualified(data: dict) -> bool:
-    """
-    Check if all required qualification fields are present.
-    """
     return all(data.get(k) for k in REQUIRED_FIELDS)
-
-
-async def generate_reply(chat_messages: list) -> str:
-    """
-    Generate a free-form AI assistant reply given chat messages.
-    """
-    response = openai.chat.completions.create(model="gpt-3.5-turbo",
-                                              messages=chat_messages,
-                                              max_tokens=150)
-    return response.choices[0].message.content.strip()
-
-
-def build_chat_messages(conversation: list) -> list:
-    """
-    Build OpenAI chat messages including a system prompt and history.
-    """
-    messages = [{
-        "role":
-        "system",
-        "content":
-        ("You are a helpful assistant for a trades business. Ask questions to qualify the job. "
-         "Always finish your responses completely. Ask clear, unambiguous questions."
-         )
-    }]
-    for direction, body in conversation:
-        role = "user" if direction == "inbound" else "assistant"
-        messages.append({"role": role, "content": body})
-    return messages
 
 
 # === Startup: create DB tables if missing ===
@@ -182,91 +150,74 @@ async def sms_webhook(
     msg_repo = MessageRepo(session)
     data_repo = ConversationDataRepo(session)
 
-    # 1) Log inbound SMS
-    await msg_repo.create_message(sender=From,
-                                  receiver=To,
-                                  body=Body,
-                                  direction="inbound")
+    # Log inbound SMS
+    await msg_repo.create_message(From, To, Body, "inbound")
 
-    # 2) Handle “[CONTACTED xyz]” from contractor
+    # Handle “[CONTACTED xyz]” from contractor
     if Body.strip().upper().startswith("[CONTACTED"):
         job = Body.strip()[10:].strip(" ]").lower()
         await data_repo.mark_handed_over(job)
-        await msg_repo.create_message(sender=To,
-                                      receiver=From,
-                                      body=f"Marked '{job}' as handed over.",
-                                      direction="outbound")
-        #return "OK"
+        note = f"Marked '{job}' as handed over."
+        await msg_repo.create_message(To, From, note, "outbound")
+        send_sms(From, note)
+        return "OK"
 
-    # 3) Fetch or start conversation
-    convo = await conv_repo.get_active_conversation(contractor_phone=To,
-                                                    customer_phone=From)
+    # Fetch any active “QUALIFYING” conversation
+    convo = await conv_repo.get_active_conversation(To, From)
+    history_str = ""
     if not convo:
-        convo = await conv_repo.create_conversation(contractor_phone=To,
-                                                    customer_phone=From)
+        # No active convo → check ambiguity
+        recent = await msg_repo.get_recent_messages(From, To, limit=10)
+        history_str = "\n".join(f"{'Customer' if d=='inbound' else 'AI'}: {b}"
+                                for d, b in recent)
+        classification = await classify_message(Body, history_str)
+        if classification == "UNSURE":
+            follow = "Hi! Is this about your previous job or a new one?"
+            await msg_repo.create_message(To, From, follow, "outbound")
+            send_sms(From, follow)
+            return "OK"
+        # Start a brand-new conversation
+        convo = await conv_repo.create_conversation(To, From)
 
-    # 4) Get recent history for classification
-    recent = await msg_repo.get_recent_messages(customer=From,
-                                                contractor=To,
-                                                limit=10)
-    history_str = "\n".join(f"{'Customer' if d=='inbound' else 'AI'}: {b}"
-                            for d, b in recent)
-
-    # 5) Classify message
-    classification = await classify_message(Body, history_str)
-    if classification == "NEW":
-        await conv_repo.close_conversation(convo.id)
-        convo = await conv_repo.create_conversation(contractor_phone=To,
-                                                    customer_phone=From)
-    elif classification == "UNSURE":
-        followup = "Hi! Is this about your previous job or a new one?"
-        await msg_repo.create_message(sender=To,
-                                      receiver=From,
-                                      body=followup,
-                                      direction="outbound")
-        send_sms(From, followup)
-        #return "OK"
-
-    # 6) Full history for extraction
+    # Pull full history for data extraction
     full = await msg_repo.get_all_conversation_messages(convo.id)
     full_hist = "\n".join(f"{'Customer' if d=='inbound' else 'AI'}: {b}"
                           for d, b in full)
 
-    # 7) Extract & upsert qualification data
+    # Extract data
     data = await extract_qualification_data(full_hist)
     print("🔍 Extracted data:", data)
     qualified_flag = is_qualified(data)
-    await data_repo.upsert(conversation_id=convo.id,
-                           contractor_phone=To,
-                           customer_phone=From,
-                           data_dict=data,
-                           qualified=qualified_flag,
-                           job_title=data.get("job_type"))
+    await data_repo.upsert(
+        conversation_id=convo.id,
+        contractor_phone=To,
+        customer_phone=From,
+        data_dict=data,
+        qualified=qualified_flag,
+        job_title=data.get("job_type"),
+    )
 
-    # 8) Two-fields-per-message prompt
-    missing = [k for k in REQUIRED_FIELDS if not data.get(k)]
+    # Two-fields-per-message prompt
+    missing = [k for k in REQUIRED_FIELDS if not data[k]]
     print("🔎 Missing fields:", missing)
     if missing:
         next_two = missing[:2]
         labels = [f.replace("_", " ") for f in next_two]
-        ask = f"Please provide your {labels[0]} and {labels[1]}."
-        await msg_repo.create_message(sender=To,
-                                      receiver=From,
-                                      body=ask,
-                                      direction="outbound")
+        if len(labels) == 1:
+            ask = f"Please provide your {labels[0]}."
+        else:
+            ask = f"Please provide your {labels[0]} and {labels[1]}."
+        await msg_repo.create_message(To, From, ask, "outbound")
         send_sms(From, ask)
-        #return "OK"
+        return "OK"
 
-    # 9) (Future) Confirmation and post‐qualification follow-up go here
-
-    # 10) Default: free-form AI reply
-    reply = await generate_reply(build_chat_messages(full))
-    await msg_repo.create_message(sender=To,
-                                  receiver=From,
-                                  body=reply,
-                                  direction="outbound")
-    send_sms(From, reply)
-    #return "OK"
+    # All required fields collected → post-qualification invite
+    follow_up = (
+        "Thanks! If there’s any other important info—parking, pets, special access—"
+        "just reply here. I’ll pass it along to your electrician.")
+    await msg_repo.create_message(To, From, follow_up, "outbound")
+    send_sms(From, follow_up)
+    return "OK"
 
 
 # === PDF Generation Endpoint ===
@@ -294,9 +245,10 @@ async def run_daily_digest():
             lines.append("✅ Complete:")
             for l in complete:
                 d = l.data_json
-                pdf_url = f"https://{os.environ['REPLIT_DOMAIN']}/pdf/{l.conversation_id}"
+                pdf_url = f"https://{os.environ.get('REPLIT_DOMAIN')}/pdf/{l.conversation_id}"
                 lines.append(
-                    f"- {d.get('job_type','')} | {d.get('property_type','')} | {d.get('urgency','')} | {d.get('address','')}\n"
+                    f"- {d.get('job_type','')} | {d.get('property_type','')} | "
+                    f"{d.get('urgency','')} | {d.get('address','')}\n"
                     f"  View: {pdf_url}")
         incomplete = [l for l in leads if not l.qualified]
         if incomplete:
