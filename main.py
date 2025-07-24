@@ -4,7 +4,7 @@ import traceback
 import asyncio
 from datetime import datetime
 
-from fastapi import FastAPI, Depends, Form
+from fastapi import FastAPI, Depends, Form, Response
 from fastapi.responses import PlainTextResponse, FileResponse
 
 from openai import OpenAI
@@ -78,9 +78,6 @@ async def classify_message(message_text: str, history_string: str) -> str:
 
 
 async def extract_qualification_data(history_string: str) -> dict:
-    """
-    Extract exactly the six keys, with no guessing.
-    """
     system_prompt = (
         "Extract exactly these fields from the conversation, based only on what the CUSTOMER explicitly said.\n"
         "Fields to extract: job_type, property_type, urgency, address, access, notes.\n"
@@ -150,23 +147,23 @@ async def sms_webhook(
     msg_repo = MessageRepo(session)
     data_repo = ConversationDataRepo(session)
 
-    # Log inbound SMS
+    # 1) Log inbound SMS
     await msg_repo.create_message(From, To, Body, "inbound")
 
-    # Handle “[CONTACTED xyz]” from contractor
+    # 2) Handle “[CONTACTED xyz]” from contractor
     if Body.strip().upper().startswith("[CONTACTED"):
         job = Body.strip()[10:].strip(" ]").lower()
         await data_repo.mark_handed_over(job)
         note = f"Marked '{job}' as handed over."
         await msg_repo.create_message(To, From, note, "outbound")
         send_sms(From, note)
-        #return "OK"
+        return Response(status_code=204)
 
-    # Fetch any active “QUALIFYING” conversation
+    # 3) Fetch any active “QUALIFYING” conversation
     convo = await conv_repo.get_active_conversation(To, From)
     history_str = ""
     if not convo:
-        # No active convo → check ambiguity
+        # No active convo → classification
         recent = await msg_repo.get_recent_messages(From, To, limit=10)
         history_str = "\n".join(f"{'Customer' if d=='inbound' else 'AI'}: {b}"
                                 for d, b in recent)
@@ -175,16 +172,15 @@ async def sms_webhook(
             follow = "Hi! Is this about your previous job or a new one?"
             await msg_repo.create_message(To, From, follow, "outbound")
             send_sms(From, follow)
-            #return "OK"
-        # Start a brand-new conversation
+            return Response(status_code=204)
         convo = await conv_repo.create_conversation(To, From)
 
-    # Pull full history for data extraction
+    # 4) Pull full history for extraction
     full = await msg_repo.get_all_conversation_messages(convo.id)
     full_hist = "\n".join(f"{'Customer' if d=='inbound' else 'AI'}: {b}"
                           for d, b in full)
 
-    # Extract data
+    # 5) Extract & upsert qualification data
     data = await extract_qualification_data(full_hist)
     print("🔍 Extracted data:", data)
     qualified_flag = is_qualified(data)
@@ -197,7 +193,7 @@ async def sms_webhook(
         job_title=data.get("job_type"),
     )
 
-    # Two-fields-per-message prompt
+    # 6) Two-fields-per-message prompt
     missing = [k for k in REQUIRED_FIELDS if not data[k]]
     print("🔎 Missing fields:", missing)
     if missing:
@@ -209,15 +205,15 @@ async def sms_webhook(
             ask = f"Please provide your {labels[0]} and {labels[1]}."
         await msg_repo.create_message(To, From, ask, "outbound")
         send_sms(From, ask)
-        #return "OK"
+        return Response(status_code=204)
 
-    # All required fields collected → post-qualification invite
+    # 7) Post-qualification invite
     follow_up = (
         "Thanks! If there’s any other important info—parking, pets, special access—"
         "just reply here. I’ll pass it along to your electrician.")
     await msg_repo.create_message(To, From, follow_up, "outbound")
     send_sms(From, follow_up)
-    #return "OK"
+    return Response(status_code=204)
 
 
 # === PDF Generation Endpoint ===
