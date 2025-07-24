@@ -48,7 +48,6 @@ def send_sms(to_number: str, message: str):
 
 
 async def classify_message(message_text: str, history_string: str) -> str:
-    """Classify only when starting a fresh conversation."""
     messages = [
         {
             "role":
@@ -163,7 +162,7 @@ async def sms_webhook(
     convo = await conv_repo.get_active_conversation(To, From)
     history_str = ""
     if not convo:
-        # No active convo → classification
+        # No active conversation → run classification
         recent = await msg_repo.get_recent_messages(From, To, limit=10)
         history_str = "\n".join(f"{'Customer' if d=='inbound' else 'AI'}: {b}"
                                 for d, b in recent)
@@ -199,20 +198,21 @@ async def sms_webhook(
     if missing:
         next_two = missing[:2]
         labels = [f.replace("_", " ") for f in next_two]
-        if len(labels) == 1:
-            ask = f"Please provide your {labels[0]}."
-        else:
-            ask = f"Please provide your {labels[0]} and {labels[1]}."
+        ask = (f"Please provide your {labels[0]}." if len(labels) == 1 else
+               f"Please provide your {labels[0]} and {labels[1]}.")
         await msg_repo.create_message(To, From, ask, "outbound")
         send_sms(From, ask)
         return Response(status_code=204)
 
-    # 7) Post-qualification invite
+    # 7) Post-qualification invite & close conversation
     follow_up = (
         "Thanks! If there’s any other important info—parking, pets, special access—"
         "just reply here. I’ll pass it along to your electrician.")
     await msg_repo.create_message(To, From, follow_up, "outbound")
     send_sms(From, follow_up)
+
+    # **Close this conversation so the next SMS starts fresh**
+    await conv_repo.close_conversation(convo.id)
     return Response(status_code=204)
 
 
