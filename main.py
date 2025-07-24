@@ -29,7 +29,6 @@ TWILIO_NUMBER = os.environ.get("TWILIO_PHONE_NUMBER", "")
 DIGEST_TEST_RECEIVER = os.environ.get("DIGEST_TEST_RECEIVER")
 
 # === Qualification Schema ===
-# We prompt for these five fields, two at a time.
 REQUIRED_FIELDS = [
     "job_type",
     "property_type",
@@ -67,7 +66,8 @@ async def classify_message(message_text: str, history_string: str) -> str:
          "- NEW: a new job request\n"
          "- CONTINUATION: same job\n"
          "- UNSURE: unclear\n"
-         "If new message mentions new location/job/type, classify as NEW.")
+         "If the new message mentions a new location, job, or type, classify as NEW."
+         )
     }, {
         "role":
         "user",
@@ -82,21 +82,17 @@ async def classify_message(message_text: str, history_string: str) -> str:
 
 async def extract_qualification_data(history_string: str) -> dict:
     """
-    Extract structured qualification fields from conversation history.
-    Always return all six keys, defaulting to empty string.
+    Extract structured qualification fields from the conversation history.
+    Only populate if explicitly mentioned; otherwise leave empty.
+    Notes collects any extra customer info.
     """
     system_prompt = (
-        "You are an assistant extracting exactly these fields from the conversation:\n"
-        "  job_type, property_type, urgency, address, access, notes\n"
-        "Respond ONLY with JSON, for example:\n"
-        "{\n"
-        '  "job_type": "Electrical repair",\n'
-        '  "property_type": "House",\n'
-        '  "urgency": "ASAP",\n'
-        '  "address": "123 Main St",\n'
-        '  "access": "Key under mat",\n'
-        '  "notes": "Customer has dog on premises"\n'
-        "}")
+        "Extract exactly these fields from the conversation, based only on what the CUSTOMER explicitly said.\n"
+        "Fields to extract: job_type, property_type, urgency, address, access, notes.\n"
+        "- If the customer did NOT mention a field, set its value to an empty string.\n"
+        "- Do NOT guess or infer anything not explicitly provided.\n"
+        "- Put any other customer comments into 'notes'.\n"
+        "Respond ONLY with a JSON object with these six keys.")
     messages = [{
         "role": "system",
         "content": system_prompt
@@ -110,6 +106,8 @@ async def extract_qualification_data(history_string: str) -> dict:
     try:
         data = json.loads(response.choices[0].message.content)
     except json.JSONDecodeError:
+        print("❗️ JSON parse error in extract_qualification_data:",
+              response.choices[0].message.content)
         data = {}
 
     # Ensure all keys exist
@@ -198,7 +196,7 @@ async def sms_webhook(
                                       receiver=From,
                                       body=f"Marked '{job}' as handed over.",
                                       direction="outbound")
-        #return "OK"
+        return "OK"
 
     # 3) Fetch or start conversation
     convo = await conv_repo.get_active_conversation(contractor_phone=To,
@@ -227,7 +225,7 @@ async def sms_webhook(
                                       body=followup,
                                       direction="outbound")
         send_sms(From, followup)
-        #return "OK"
+        return "OK"
 
     # 6) Full history for extraction
     full = await msg_repo.get_all_conversation_messages(convo.id)
@@ -236,21 +234,20 @@ async def sms_webhook(
 
     # 7) Extract & upsert qualification data
     data = await extract_qualification_data(full_hist)
+    print("🔍 Extracted data:", data)
     qualified_flag = is_qualified(data)
-    await data_repo.upsert(
-        conversation_id=convo.id,
-        contractor_phone=To,
-        customer_phone=From,
-        data_dict=data,
-        qualified=qualified_flag,
-        job_title=data.get("job_type")  # temporary
-    )
+    await data_repo.upsert(conversation_id=convo.id,
+                           contractor_phone=To,
+                           customer_phone=From,
+                           data_dict=data,
+                           qualified=qualified_flag,
+                           job_title=data.get("job_type"))
 
     # 8) Two-fields-per-message prompt
     missing = [k for k in REQUIRED_FIELDS if not data.get(k)]
+    print("🔎 Missing fields:", missing)
     if missing:
         next_two = missing[:2]
-        # humanize field names
         labels = [f.replace("_", " ") for f in next_two]
         ask = f"Please provide your {labels[0]} and {labels[1]}."
         await msg_repo.create_message(sender=To,
@@ -258,7 +255,7 @@ async def sms_webhook(
                                       body=ask,
                                       direction="outbound")
         send_sms(From, ask)
-        #return "OK"
+        return "OK"
 
     # 9) (Future) Confirmation and post‐qualification follow-up go here
 
@@ -269,8 +266,7 @@ async def sms_webhook(
                                   body=reply,
                                   direction="outbound")
     send_sms(From, reply)
-
-    #return "OK"
+    return "OK"
 
 
 # === PDF Generation Endpoint ===
@@ -300,8 +296,8 @@ async def run_daily_digest():
                 d = l.data_json
                 pdf_url = f"https://{os.environ['REPLIT_DOMAIN']}/pdf/{l.conversation_id}"
                 lines.append(
-                    f"- {d.get('job_type','')} | {d.get('property_type','')} | {d.get('urgency','')} | {d.get('address','')}\n  View: {pdf_url}"
-                )
+                    f"- {d.get('job_type','')} | {d.get('property_type','')} | {d.get('urgency','')} | {d.get('address','')}\n"
+                    f"  View: {pdf_url}")
         incomplete = [l for l in leads if not l.qualified]
         if incomplete:
             lines.append("⏸️ Incomplete:")
