@@ -160,7 +160,7 @@ async def sms_webhook(
         note = f"Marked '{job}' as handed over."
         await msg_repo.create_message(To, From, note, "outbound")
         send_sms(From, note)
-        return "OK"
+        #return "OK"
 
     # Fetch any active “QUALIFYING” conversation
     convo = await conv_repo.get_active_conversation(To, From)
@@ -175,7 +175,7 @@ async def sms_webhook(
             follow = "Hi! Is this about your previous job or a new one?"
             await msg_repo.create_message(To, From, follow, "outbound")
             send_sms(From, follow)
-            return "OK"
+            #return "OK"
         # Start a brand-new conversation
         convo = await conv_repo.create_conversation(To, From)
 
@@ -209,7 +209,7 @@ async def sms_webhook(
             ask = f"Please provide your {labels[0]} and {labels[1]}."
         await msg_repo.create_message(To, From, ask, "outbound")
         send_sms(From, ask)
-        return "OK"
+        #return "OK"
 
     # All required fields collected → post-qualification invite
     follow_up = (
@@ -217,7 +217,7 @@ async def sms_webhook(
         "just reply here. I’ll pass it along to your electrician.")
     await msg_repo.create_message(To, From, follow_up, "outbound")
     send_sms(From, follow_up)
-    return "OK"
+    #return "OK"
 
 
 # === PDF Generation Endpoint ===
