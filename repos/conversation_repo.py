@@ -13,13 +13,15 @@ class ConversationRepo:
     async def get_active_conversation(self, contractor_phone: str,
                                       customer_phone: str):
         """
-        Return the open 'QUALIFYING' conversation for these two numbers, if any.
+        Return the open conversation (QUALIFYING or CONFIRMING) for these two numbers, if any.
         """
-        q = (select(Conversation).where(
-            Conversation.contractor_phone == contractor_phone,
-            Conversation.customer_phone == customer_phone,
-            Conversation.status == "QUALIFYING",
-        ))
+        q = (
+            select(Conversation).where(
+                Conversation.contractor_phone == contractor_phone,
+                Conversation.customer_phone == customer_phone,
+                # include both QUALIFYING and CONFIRMING
+                Conversation.status != "COMPLETE",
+            ))
         result = await self.session.execute(q)
         return result.scalars().first()
 
