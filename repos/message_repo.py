@@ -8,12 +8,17 @@ class MessageRepo:
     def __init__(self, session: AsyncSession):
         self.session = session
 
-    async def create_message(self, sender: str, receiver: str, body: str,
-                             direction: str):
+    async def create_message(self,
+                             sender: str,
+                             receiver: str,
+                             body: str,
+                             direction: str,
+                             conversation_id: str | None = None):
         """
-        Insert a new SMS message into the log.
+        Insert a new SMS message into the log, tagged with conversation_id.
         """
         msg = Message(
+            conversation_id=conversation_id,
             sender=sender,
             receiver=receiver,
             body=body,
@@ -29,6 +34,7 @@ class MessageRepo:
                                   limit: int = 10):
         """
         Fetch the last `limit` messages between the two numbers, newest first.
+        (Used only for classification when there's no active conversation.)
         """
         stmt = (select(
             Message.direction,
@@ -39,23 +45,14 @@ class MessageRepo:
                                        Message.timestamp.desc()).limit(limit))
         result = await self.session.execute(stmt)
         rows = result.all()
-        # return oldest→newest
         return list(reversed(rows))
 
     async def get_all_conversation_messages(self, conversation_id: str):
         """
-        Get the full history of a conversation by joining on the Conversation table.
+        Get the full history of a conversation, filtered by conversation_id.
         """
-        # First, fetch the convo to learn the two phone numbers
-        convo = await self.session.get(Conversation, conversation_id)
-        if not convo:
-            return []
-
-        stmt = (select(Message.direction, Message.body).where((
-            (Message.sender == convo.customer_phone)
-            & (Message.receiver == convo.contractor_phone)) | (
-                (Message.sender == convo.contractor_phone)
-                & (Message.receiver == convo.customer_phone))).order_by(
-                    Message.timestamp.asc()))
+        stmt = (select(Message.direction, Message.body).where(
+            Message.conversation_id == conversation_id).order_by(
+                Message.timestamp.asc()))
         result = await self.session.execute(stmt)
         return result.all()

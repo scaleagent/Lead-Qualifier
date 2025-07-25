@@ -1,7 +1,15 @@
 import uuid
 from datetime import datetime
-from sqlalchemy import (Column, String, DateTime, Integer, JSON, Boolean, Text,
-                        ForeignKey)
+from sqlalchemy import (
+    Column,
+    String,
+    DateTime,
+    Integer,
+    JSON,
+    Boolean,
+    Text,
+    ForeignKey,
+)
 from sqlalchemy.ext.declarative import declarative_base
 
 Base = declarative_base()
@@ -22,6 +30,11 @@ class Conversation(Base):
 class Message(Base):
     __tablename__ = "messages"
     id = Column(Integer, primary_key=True, autoincrement=True)
+    conversation_id = Column(
+        String,
+        ForeignKey("conversations.id", ondelete="CASCADE"),
+        nullable=True,
+    )
     sender = Column(String, nullable=False)
     receiver = Column(String, nullable=False)
     body = Column(Text, nullable=False)

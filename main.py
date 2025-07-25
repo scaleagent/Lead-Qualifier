@@ -115,26 +115,22 @@ def is_qualified(data: dict) -> bool:
     return all(data.get(k) for k in REQUIRED_FIELDS)
 
 
-# === Startup: create DB tables if missing ===
 @app.on_event("startup")
 async def on_startup():
     async with async_engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
 
-# === Health-check endpoint ===
 @app.get("/", response_class=PlainTextResponse)
 def read_root():
     return "✅ SMS-Lead-Qual API is running."
 
 
-# === Dependency: Async DB session per request ===
 async def get_session():
     async with AsyncSessionLocal() as session:
         yield session
 
 
-# === SMS Webhook Handler ===
 @app.post("/sms", response_class=PlainTextResponse)
 async def sms_webhook(
         From: str = Form(...),
@@ -146,10 +142,7 @@ async def sms_webhook(
     msg_repo = MessageRepo(session)
     data_repo = ConversationDataRepo(session)
 
-    # 1) Log inbound SMS
-    await msg_repo.create_message(From, To, Body, "inbound")
-
-    # 2) Handle “[CONTACTED xyz]” from contractor
+    # 1) Handle “[CONTACTED xyz]” (no conversation_id needed)
     if Body.strip().upper().startswith("[CONTACTED"):
         job = Body.strip()[10:].strip(" ]").lower()
         await data_repo.mark_handed_over(job)
@@ -158,11 +151,11 @@ async def sms_webhook(
         send_sms(From, note)
         return Response(status_code=204)
 
-    # 3) Fetch any active “QUALIFYING” conversation
+    # 2) Fetch or start a QUALIFYING conversation
     convo = await conv_repo.get_active_conversation(To, From)
     history_str = ""
     if not convo:
-        # No active conversation → run classification
+        # Classification only when there's truly NO active convo
         recent = await msg_repo.get_recent_messages(From, To, limit=10)
         history_str = "\n".join(f"{'Customer' if d=='inbound' else 'AI'}: {b}"
                                 for d, b in recent)
@@ -174,12 +167,17 @@ async def sms_webhook(
             return Response(status_code=204)
         convo = await conv_repo.create_conversation(To, From)
 
-    # 4) Pull full history for extraction
+    # 3) Log inbound SMS with conversation_id
+    await msg_repo.create_message(From,
+                                  To,
+                                  Body,
+                                  "inbound",
+                                  conversation_id=convo.id)
+
+    # 4) Pull & extract data from this conversation only
     full = await msg_repo.get_all_conversation_messages(convo.id)
     full_hist = "\n".join(f"{'Customer' if d=='inbound' else 'AI'}: {b}"
                           for d, b in full)
-
-    # 5) Extract & upsert qualification data
     data = await extract_qualification_data(full_hist)
     print("🔍 Extracted data:", data)
     qualified_flag = is_qualified(data)
@@ -192,7 +190,7 @@ async def sms_webhook(
         job_title=data.get("job_type"),
     )
 
-    # 6) Two-fields-per-message prompt
+    # 5) Two-fields-per-message prompt
     missing = [k for k in REQUIRED_FIELDS if not data[k]]
     print("🔎 Missing fields:", missing)
     if missing:
@@ -200,30 +198,34 @@ async def sms_webhook(
         labels = [f.replace("_", " ") for f in next_two]
         ask = (f"Please provide your {labels[0]}." if len(labels) == 1 else
                f"Please provide your {labels[0]} and {labels[1]}.")
-        await msg_repo.create_message(To, From, ask, "outbound")
+        await msg_repo.create_message(To,
+                                      From,
+                                      ask,
+                                      "outbound",
+                                      conversation_id=convo.id)
         send_sms(From, ask)
         return Response(status_code=204)
 
-    # 7) Post-qualification invite & close conversation
+    # 6) Post-qualification invite & close
     follow_up = (
         "Thanks! If there’s any other important info—parking, pets, special access—"
         "just reply here. I’ll pass it along to your electrician.")
-    await msg_repo.create_message(To, From, follow_up, "outbound")
+    await msg_repo.create_message(To,
+                                  From,
+                                  follow_up,
+                                  "outbound",
+                                  conversation_id=convo.id)
     send_sms(From, follow_up)
-
-    # **Close this conversation so the next SMS starts fresh**
     await conv_repo.close_conversation(convo.id)
     return Response(status_code=204)
 
 
-# === PDF Generation Endpoint ===
 @app.get("/pdf/{convo_id}")
 def generate_pdf(convo_id: str):
     path = f"/tmp/{convo_id}.pdf"
     return FileResponse(path, media_type="application/pdf")
 
 
-# === Daily Digest Task ===
 async def run_daily_digest():
     async with AsyncSessionLocal() as session:
         data_repo = ConversationDataRepo(session)
@@ -260,7 +262,6 @@ async def run_daily_digest():
         send_sms(contractor, body)
 
 
-# === Scheduler setup ===
 scheduler = BackgroundScheduler()
 scheduler.add_job(lambda: asyncio.create_task(run_daily_digest()),
                   "cron",
