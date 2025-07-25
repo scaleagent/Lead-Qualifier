@@ -2,6 +2,7 @@ import os
 import json
 import traceback
 import asyncio
+import re
 from datetime import datetime
 
 from fastapi import FastAPI, Depends, Form, Response
@@ -35,6 +36,8 @@ REQUIRED_FIELDS = [
     "access",
 ]
 
+# === Helpers ===
+
 
 def send_sms(to_number: str, message: str):
     try:
@@ -66,25 +69,25 @@ async def classify_message(message_text: str, history_string: str) -> str:
             f"Message:\n{message_text}\n\nHistory:\n{history_string}",
         },
     ]
-    response = openai.chat.completions.create(
+    resp = openai.chat.completions.create(
         model="gpt-3.5-turbo",
         messages=messages,
         temperature=0,
         top_p=1,
         max_tokens=50,
     )
-    return response.choices[0].message.content.strip().upper()
+    return resp.choices[0].message.content.strip().upper()
 
 
 async def extract_qualification_data(history_string: str) -> dict:
     system_prompt = (
         "Extract exactly these fields from the conversation, based only on what the CUSTOMER explicitly said.\n"
-        "Fields to extract: job_type, property_type, urgency, address, access, notes.\n"
-        "- If the customer did NOT mention a field, set its value to an empty string.\n"
-        "- Do NOT guess or infer anything not explicitly provided.\n"
-        "- Put any other customer comments into 'notes'.\n"
-        "Respond ONLY with a JSON object with these six keys.")
-    messages = [
+        "Fields: job_type, property_type, urgency, address, access, notes.\n"
+        "- If NOT mentioned, set value to empty string.\n"
+        "- Do NOT guess or infer.\n"
+        "- Put all other customer comments into 'notes'.\n"
+        "Respond ONLY with a JSON object with exactly these six keys.")
+    msgs = [
         {
             "role": "system",
             "content": system_prompt
@@ -94,27 +97,72 @@ async def extract_qualification_data(history_string: str) -> dict:
             "content": f"Conversation:\n{history_string}"
         },
     ]
-    response = openai.chat.completions.create(
+    resp = openai.chat.completions.create(
         model="gpt-3.5-turbo",
-        messages=messages,
+        messages=msgs,
         temperature=0,
         top_p=1,
         max_tokens=300,
     )
     try:
-        data = json.loads(response.choices[0].message.content)
+        data = json.loads(resp.choices[0].message.content)
     except json.JSONDecodeError:
-        print("❗️ JSON parse error:", response.choices[0].message.content)
+        print("❗️ JSON parse error:", resp.choices[0].message.content)
         data = {}
     for key in REQUIRED_FIELDS + ["notes"]:
         data.setdefault(key, "")
     return data
 
 
+async def apply_correction_data(current: dict, correction: str) -> dict:
+    """
+    Use the model to apply a customer correction to the existing JSON.
+    """
+    system_prompt = (
+        "You are a JSON assistant. Given existing job data and a user's correction,"
+        " return the updated JSON with the same six keys only.")
+    user_prompt = (f"Existing data: {json.dumps(current)}\n"
+                   f"Correction: {correction}\n"
+                   "Respond ONLY with the full updated JSON.")
+    msgs = [
+        {
+            "role": "system",
+            "content": system_prompt
+        },
+        {
+            "role": "user",
+            "content": user_prompt
+        },
+    ]
+    resp = openai.chat.completions.create(
+        model="gpt-3.5-turbo",
+        messages=msgs,
+        temperature=0,
+        top_p=1,
+        max_tokens=300,
+    )
+    try:
+        updated = json.loads(resp.choices[0].message.content)
+    except json.JSONDecodeError:
+        print("❗️ Correction JSON parse error:",
+              resp.choices[0].message.content)
+        updated = current
+    for key in REQUIRED_FIELDS + ["notes"]:
+        updated.setdefault(key, current.get(key, ""))
+    return updated
+
+
+def is_affirmative(text: str) -> bool:
+    return bool(
+        re.match(r"^(yes|yep|yeah|correct|that is correct)\b",
+                 text.strip().lower()))
+
+
 def is_qualified(data: dict) -> bool:
     return all(data.get(k) for k in REQUIRED_FIELDS)
 
 
+# === FastAPI setup ===
 @app.on_event("startup")
 async def on_startup():
     async with async_engine.begin() as conn:
@@ -142,8 +190,9 @@ async def sms_webhook(
     msg_repo = MessageRepo(session)
     data_repo = ConversationDataRepo(session)
 
-    # 1) Handle “[CONTACTED xyz]” (no conversation_id needed)
+    # 1) Handle "[CONTACTED ...]" if ever needed
     if Body.strip().upper().startswith("[CONTACTED"):
+        # (we’ll scope this to contractors later)
         job = Body.strip()[10:].strip(" ]").lower()
         await data_repo.mark_handed_over(job)
         note = f"Marked '{job}' as handed over."
@@ -151,51 +200,49 @@ async def sms_webhook(
         send_sms(From, note)
         return Response(status_code=204)
 
-    # 2) Fetch or start a QUALIFYING conversation
+    # 2) Find or start QUALIFYING conversation
     convo = await conv_repo.get_active_conversation(To, From)
-    history_str = ""
     if not convo:
-        # Classification only when there's truly NO active convo
+        # No active convo → classification for ambiguity
         recent = await msg_repo.get_recent_messages(From, To, limit=10)
-        history_str = "\n".join(f"{'Customer' if d=='inbound' else 'AI'}: {b}"
-                                for d, b in recent)
-        classification = await classify_message(Body, history_str)
-        if classification == "UNSURE":
+        hist = "\n".join(f"{'Customer' if d=='inbound' else 'AI'}: {b}"
+                         for d, b in recent)
+        cls = await classify_message(Body, hist)
+        if cls == "UNSURE":
             follow = "Hi! Is this about your previous job or a new one?"
             await msg_repo.create_message(To, From, follow, "outbound")
             send_sms(From, follow)
             return Response(status_code=204)
         convo = await conv_repo.create_conversation(To, From)
 
-    # 3) Log inbound SMS with conversation_id
+    # 3) Log inbound with conversation_id
     await msg_repo.create_message(From,
                                   To,
                                   Body,
                                   "inbound",
                                   conversation_id=convo.id)
 
-    # 4) Pull & extract data from this conversation only
+    # 4) Fetch this conversation's history & extract data
     full = await msg_repo.get_all_conversation_messages(convo.id)
-    full_hist = "\n".join(f"{'Customer' if d=='inbound' else 'AI'}: {b}"
-                          for d, b in full)
-    data = await extract_qualification_data(full_hist)
+    hist = "\n".join(f"{'Customer' if d=='inbound' else 'AI'}: {b}"
+                     for d, b in full)
+    data = await extract_qualification_data(hist)
     print("🔍 Extracted data:", data)
-    qualified_flag = is_qualified(data)
     await data_repo.upsert(
         conversation_id=convo.id,
         contractor_phone=To,
         customer_phone=From,
         data_dict=data,
-        qualified=qualified_flag,
+        qualified=is_qualified(data),
         job_title=data.get("job_type"),
     )
 
-    # 5) Two-fields-per-message prompt
+    # 5) Two-field prompts if still missing
     missing = [k for k in REQUIRED_FIELDS if not data[k]]
     print("🔎 Missing fields:", missing)
     if missing:
-        next_two = missing[:2]
-        labels = [f.replace("_", " ") for f in next_two]
+        nxt = missing[:2]
+        labels = [f.replace("_", " ") for f in nxt]
         ask = (f"Please provide your {labels[0]}." if len(labels) == 1 else
                f"Please provide your {labels[0]} and {labels[1]}.")
         await msg_repo.create_message(To,
@@ -206,17 +253,70 @@ async def sms_webhook(
         send_sms(From, ask)
         return Response(status_code=204)
 
-    # 6) Post-qualification invite & close
-    follow_up = (
-        "Thanks! If there’s any other important info—parking, pets, special access—"
-        "just reply here. I’ll pass it along to your electrician.")
-    await msg_repo.create_message(To,
-                                  From,
-                                  follow_up,
-                                  "outbound",
-                                  conversation_id=convo.id)
-    send_sms(From, follow_up)
-    await conv_repo.close_conversation(convo.id)
+    # 6) Confirmation loop
+    if convo.status == "QUALIFYING":
+        # First time all fields present: send summary
+        lines = [
+            f"• {f.replace('_', ' ').title()}: {data[f]}"
+            for f in REQUIRED_FIELDS
+        ]
+        summary = "Here’s what I have so far:\n" + "\n".join(
+            lines) + "\nIs that correct?"
+        await msg_repo.create_message(To,
+                                      From,
+                                      summary,
+                                      "outbound",
+                                      conversation_id=convo.id)
+        send_sms(From, summary)
+        convo.status = "CONFIRMING"
+        await session.commit()
+        return Response(status_code=204)
+
+    if convo.status == "CONFIRMING":
+        # Handle customer response to summary
+        if is_affirmative(Body):
+            # Affirmed → post-qualification invite & close
+            follow_up = (
+                "Thanks! If there’s any other important info—parking, pets, special access—"
+                "just reply here. I’ll pass it along to your electrician.")
+            await msg_repo.create_message(To,
+                                          From,
+                                          follow_up,
+                                          "outbound",
+                                          conversation_id=convo.id)
+            send_sms(From, follow_up)
+            await conv_repo.close_conversation(convo.id)
+            return Response(status_code=204)
+        else:
+            # Correction → apply and re-confirm
+            updated = await apply_correction_data(data, Body)
+            print("🔄 Corrected data:", updated)
+            await data_repo.upsert(
+                conversation_id=convo.id,
+                contractor_phone=To,
+                customer_phone=From,
+                data_dict=updated,
+                qualified=is_qualified(updated),
+                job_title=updated.get("job_type"),
+            )
+            # Resend summary
+            lines = [
+                f"• {f.replace('_', ' ').title()}: {updated[f]}"
+                for f in REQUIRED_FIELDS
+            ]
+            summary = "Got it! Here’s the updated info:\n" + "\n".join(
+                lines) + "\nIs that correct?"
+            await msg_repo.create_message(To,
+                                          From,
+                                          summary,
+                                          "outbound",
+                                          conversation_id=convo.id)
+            send_sms(From, summary)
+            # status remains CONFIRMING
+            return Response(status_code=204)
+
+    # (No free-form fallback any more)
+
     return Response(status_code=204)
 
 
