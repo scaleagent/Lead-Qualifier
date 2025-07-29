@@ -51,6 +51,7 @@ def send_sms(to_number: str, message: str):
 
 
 async def classify_message(message_text: str, history_string: str) -> str:
+    # ... unchanged ...
     messages = [
         {
             "role":
@@ -80,6 +81,7 @@ async def classify_message(message_text: str, history_string: str) -> str:
 
 
 async def extract_qualification_data(history_string: str) -> dict:
+    # ... unchanged ...
     system_prompt = (
         "Extract exactly these fields from the conversation, based only on what the CUSTOMER explicitly said.\n"
         "Fields: job_type, property_type, urgency, address, access, notes.\n"
@@ -115,9 +117,7 @@ async def extract_qualification_data(history_string: str) -> dict:
 
 
 async def apply_correction_data(current: dict, correction: str) -> dict:
-    """
-    Use the model to apply a customer correction to the existing JSON.
-    """
+    # ... unchanged ...
     system_prompt = (
         "You are a JSON assistant. Given existing job data and a user's correction,"
         " return the updated JSON with the same six keys only.")
@@ -163,6 +163,8 @@ def is_qualified(data: dict) -> bool:
 
 
 # === FastAPI setup ===
+
+
 @app.on_event("startup")
 async def on_startup():
     async with async_engine.begin() as conn:
@@ -192,7 +194,6 @@ async def sms_webhook(
 
     # 1) Handle "[CONTACTED ...]" if ever needed
     if Body.strip().upper().startswith("[CONTACTED"):
-        # (we’ll scope this to contractors later)
         job = Body.strip()[10:].strip(" ]").lower()
         await data_repo.mark_handed_over(job)
         note = f"Marked '{job}' as handed over."
@@ -200,10 +201,30 @@ async def sms_webhook(
         send_sms(From, note)
         return Response(status_code=204)
 
-    # 2) Find or start QUALIFYING conversation
+    # 2) NEW: “Reach out to +44…” command from contractor
+    match = re.match(r'^\s*reach out to (\+44\d{9,})\s*$', Body.strip(),
+                     re.IGNORECASE)
+    if match:
+        customer_number = match.group(1)
+        # spin up a fresh conversation
+        convo = await conv_repo.create_conversation(
+            contractor_phone=From, customer_phone=customer_number)
+        # send first two prompts
+        intro = (
+            f"Hi! I’m your scheduling assistant. To get you a quote, could you share your "
+            f"job type and property type? If you already told your contractor some details, "
+            f"please repeat them here so I capture everything.")
+        await msg_repo.create_message(To,
+                                      customer_number,
+                                      intro,
+                                      "outbound",
+                                      conversation_id=convo.id)
+        send_sms(customer_number, intro)
+        return Response(status_code=204)
+
+    # 3) Find or start QUALIFYING conversation (existing flow)
     convo = await conv_repo.get_active_conversation(To, From)
     if not convo:
-        # No active convo → classification for ambiguity
         recent = await msg_repo.get_recent_messages(From, To, limit=10)
         hist = "\n".join(f"{'Customer' if d=='inbound' else 'AI'}: {b}"
                          for d, b in recent)
@@ -215,14 +236,14 @@ async def sms_webhook(
             return Response(status_code=204)
         convo = await conv_repo.create_conversation(To, From)
 
-    # 3) Log inbound with conversation_id
+    # 4) Log inbound with conversation_id
     await msg_repo.create_message(From,
                                   To,
                                   Body,
                                   "inbound",
                                   conversation_id=convo.id)
 
-    # 4) Fetch this conversation's history & extract data
+    # 5) Extract & upsert data
     full = await msg_repo.get_all_conversation_messages(convo.id)
     hist = "\n".join(f"{'Customer' if d=='inbound' else 'AI'}: {b}"
                      for d, b in full)
@@ -237,7 +258,7 @@ async def sms_webhook(
         job_title=data.get("job_type"),
     )
 
-    # 5) Two-field prompts if still missing
+    # 6) Two-field prompts if still missing
     missing = [k for k in REQUIRED_FIELDS if not data[k]]
     print("🔎 Missing fields:", missing)
     if missing:
@@ -253,9 +274,8 @@ async def sms_webhook(
         send_sms(From, ask)
         return Response(status_code=204)
 
-    # 6) Confirmation loop
+    # 7) Confirmation loop
     if convo.status == "QUALIFYING":
-        # First time all fields present: send summary
         lines = [
             f"• {f.replace('_', ' ').title()}: {data[f]}"
             for f in REQUIRED_FIELDS
@@ -273,9 +293,7 @@ async def sms_webhook(
         return Response(status_code=204)
 
     if convo.status == "CONFIRMING":
-        # Handle customer response to summary
         if is_affirmative(Body):
-            # Affirmed → post-qualification invite & close
             follow_up = (
                 "Thanks! If there’s any other important info—parking, pets, special access—"
                 "just reply here. I’ll pass it along to your electrician.")
@@ -288,7 +306,6 @@ async def sms_webhook(
             await conv_repo.close_conversation(convo.id)
             return Response(status_code=204)
         else:
-            # Correction → apply and re-confirm
             updated = await apply_correction_data(data, Body)
             print("🔄 Corrected data:", updated)
             await data_repo.upsert(
@@ -299,7 +316,6 @@ async def sms_webhook(
                 qualified=is_qualified(updated),
                 job_title=updated.get("job_type"),
             )
-            # Resend summary
             lines = [
                 f"• {f.replace('_', ' ').title()}: {updated[f]}"
                 for f in REQUIRED_FIELDS
@@ -312,10 +328,7 @@ async def sms_webhook(
                                           "outbound",
                                           conversation_id=convo.id)
             send_sms(From, summary)
-            # status remains CONFIRMING
             return Response(status_code=204)
-
-    # (No free-form fallback any more)
 
     return Response(status_code=204)
 
