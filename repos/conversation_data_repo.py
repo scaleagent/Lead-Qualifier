@@ -9,18 +9,9 @@ class ConversationDataRepo:
     def __init__(self, session: AsyncSession):
         self.session = session
 
-    async def upsert(
-        self,
-        conversation_id: str,
-        contractor_phone: str,
-        customer_phone: str,
-        data_dict: dict,
-        qualified: bool,
-        job_title: str,
-    ):
-        """
-        Insert or update the qualification data for a conversation.
-        """
+    async def upsert(self, conversation_id: str, contractor_id: int,
+                     customer_phone: str, data_dict: dict, qualified: bool,
+                     job_title: str):
         existing = await self.session.get(ConversationData, conversation_id)
         if existing:
             existing.data_json = data_dict
@@ -30,7 +21,7 @@ class ConversationDataRepo:
         else:
             new = ConversationData(
                 conversation_id=conversation_id,
-                contractor_phone=contractor_phone,
+                contractor_id=contractor_id,
                 customer_phone=customer_phone,
                 data_json=data_dict,
                 last_updated=datetime.utcnow(),

@@ -1,7 +1,8 @@
+# repos/conversation_repo.py
+
 from datetime import datetime
 from sqlalchemy.future import select
 from sqlalchemy.ext.asyncio import AsyncSession
-
 from .models import Conversation
 
 
@@ -10,39 +11,34 @@ class ConversationRepo:
     def __init__(self, session: AsyncSession):
         self.session = session
 
-    async def get_active_conversation(self, contractor_phone: str,
+    async def get_active_conversation(self, contractor_id: int,
                                       customer_phone: str):
-        """
-        Return the open conversation (QUALIFYING or CONFIRMING) for these two numbers, if any.
-        """
-        q = (
-            select(Conversation).where(
-                Conversation.contractor_phone == contractor_phone,
-                Conversation.customer_phone == customer_phone,
-                # include both QUALIFYING and CONFIRMING
-                Conversation.status != "COMPLETE",
-            ))
-        result = await self.session.execute(q)
+        stmt = (select(Conversation).where(
+            Conversation.contractor_id == contractor_id,
+            Conversation.customer_phone == customer_phone,
+            Conversation.status != "COMPLETE",
+        ))
+        result = await self.session.execute(stmt)
         return result.scalars().first()
 
-    async def create_conversation(self, contractor_phone: str,
+    async def get_active_by_customer(self, customer_phone: str):
+        stmt = (select(Conversation).where(
+            Conversation.customer_phone == customer_phone,
+            Conversation.status != "COMPLETE",
+        ))
+        result = await self.session.execute(stmt)
+        return result.scalars().first()
+
+    async def create_conversation(self, contractor_id: int,
                                   customer_phone: str):
-        """
-        Start a new conversation record.
-        """
-        convo = Conversation(
-            contractor_phone=contractor_phone,
-            customer_phone=customer_phone,
-        )
+        convo = Conversation(contractor_id=contractor_id,
+                             customer_phone=customer_phone)
         self.session.add(convo)
         await self.session.commit()
         await self.session.refresh(convo)
         return convo
 
     async def close_conversation(self, conversation_id: str):
-        """
-        Mark a conversation as COMPLETE.
-        """
         convo = await self.session.get(Conversation, conversation_id)
         if convo:
             convo.status = "COMPLETE"
