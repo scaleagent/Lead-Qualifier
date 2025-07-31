@@ -62,12 +62,12 @@ async def classify_message(message_text: str, history_string: str) -> str:
              "- CONTINUATION: same job\n"
              "- UNSURE: unclear\n"
              "If the new message mentions a new location, job, or type, classify as NEW."
-             ),
+             )
         },
         {
             "role": "user",
             "content":
-            f"Message:\n{message_text}\n\nHistory:\n{history_string}",
+            f"Message:\n{message_text}\n\nHistory:\n{history_string}"
         },
     ]
     resp = openai.chat.completions.create(
@@ -186,17 +186,21 @@ async def sms_webhook(
         Body: str = Form(...),
         session=Depends(get_session),
 ):
+    # Normalize inputs and debug
+    From = From.strip()
+    To = To.strip()
+    Body = Body.strip()
+    print(f"🔔 raw incoming From=`{From}`, To=`{To}`, Body=`{Body}`")
+
     contractor_repo = ContractorRepo(session)
     conv_repo = ConversationRepo(session)
     msg_repo = MessageRepo(session)
     data_repo = ConversationDataRepo(session)
 
-    # Identify sender
+    # Identify sender as contractor
     contractor = await contractor_repo.get_by_phone(From)
     if contractor:
-        # Handle contractor command: "reach out to +44..."
-        m = re.match(r'^\s*reach out to (\+44\d{9,})\s*$', Body.strip(),
-                     re.IGNORECASE)
+        m = re.match(r'^\s*reach out to (\+44\d{9,})\s*$', Body, re.IGNORECASE)
         if m:
             customer_phone = m.group(1)
             convo = await conv_repo.create_conversation(
@@ -206,34 +210,32 @@ async def sms_webhook(
                 "To get you a quote, could you share your job type and property type? "
                 "If you already told your contractor some details, please repeat them."
             )
-            await msg_repo.create_message(From,
-                                          customer_phone,
-                                          intro,
-                                          "outbound",
+            await msg_repo.create_message(sender=From,
+                                          receiver=customer_phone,
+                                          body=intro,
+                                          direction="outbound",
                                           conversation_id=convo.id)
             send_sms(customer_phone, intro)
         return Response(status_code=204)
 
-    # Otherwise, treat as customer message
-    # 1) Find active conversation by customer
-    old = await conv_repo.get_active_by_customer(From)
-    if not old:
-        # No active convo for this customer → ignore
+    # Otherwise customer message
+    old_convo = await conv_repo.get_active_by_customer(From)
+    if not old_convo:
         return Response(status_code=204)
-    convo = old
+    convo = old_convo
     contractor_id = convo.contractor_id
 
-    # 2) Log inbound
-    await msg_repo.create_message(From,
-                                  To,
-                                  Body,
-                                  "inbound",
+    # Log inbound
+    await msg_repo.create_message(sender=From,
+                                  receiver=To,
+                                  body=Body,
+                                  direction="inbound",
                                   conversation_id=convo.id)
 
-    # 3) Extract & upsert data
-    all_msgs = await msg_repo.get_all_conversation_messages(convo.id)
+    # Extract & upsert
+    full_msgs = await msg_repo.get_all_conversation_messages(convo.id)
     history = "\n".join(f"{'Customer' if d=='inbound' else 'AI'}: {b}"
-                        for d, b in all_msgs)
+                        for d, b in full_msgs)
     data = await extract_qualification_data(history)
     await data_repo.upsert(
         conversation_id=convo.id,
@@ -244,33 +246,33 @@ async def sms_webhook(
         job_title=data.get("job_type"),
     )
 
-    # 4) Prompt missing fields
+    # Prompt missing fields
     missing = [k for k in REQUIRED_FIELDS if not data[k]]
     if missing:
         nxt = missing[:2]
         labels = [f.replace("_", " ") for f in nxt]
         ask = (f"Please provide your {labels[0]}." if len(labels) == 1 else
                f"Please provide your {labels[0]} and {labels[1]}.")
-        await msg_repo.create_message(To,
-                                      From,
-                                      ask,
-                                      "outbound",
+        await msg_repo.create_message(sender=To,
+                                      receiver=From,
+                                      body=ask,
+                                      direction="outbound",
                                       conversation_id=convo.id)
         send_sms(From, ask)
         return Response(status_code=204)
 
-    # 5) Confirmation loop
+    # Confirmation loop
     if convo.status == "QUALIFYING":
         bullets = [
             f"• {f.replace('_',' ').title()}: {data[f]}"
             for f in REQUIRED_FIELDS
         ]
-        summary = ("Here’s what I have so far:\n" + "\n".join(bullets) +
-                   "\nIs that correct?")
-        await msg_repo.create_message(To,
-                                      From,
-                                      summary,
-                                      "outbound",
+        summary = "Here’s what I have so far:\n" + "\n".join(
+            bullets) + "\nIs that correct?"
+        await msg_repo.create_message(sender=To,
+                                      receiver=From,
+                                      body=summary,
+                                      direction="outbound",
                                       conversation_id=convo.id)
         send_sms(From, summary)
         convo.status = "CONFIRMING"
@@ -282,10 +284,10 @@ async def sms_webhook(
             follow = (
                 "Thanks! If there’s any other important info—parking, pets, special access—"
                 "just reply here. I’ll pass it along to your contractor.")
-            await msg_repo.create_message(To,
-                                          From,
-                                          follow,
-                                          "outbound",
+            await msg_repo.create_message(sender=To,
+                                          receiver=From,
+                                          body=follow,
+                                          direction="outbound",
                                           conversation_id=convo.id)
             send_sms(From, follow)
             await conv_repo.close_conversation(convo.id)
@@ -304,12 +306,12 @@ async def sms_webhook(
                 f"• {f.replace('_',' ').title()}: {updated[f]}"
                 for f in REQUIRED_FIELDS
             ]
-            summary = ("Got it! Here’s the updated info:\n" +
-                       "\n".join(bullets) + "\nIs that correct?")
-            await msg_repo.create_message(To,
-                                          From,
-                                          summary,
-                                          "outbound",
+            summary = "Got it! Here’s the updated info:\n" + "\n".join(
+                bullets) + "\nIs that correct?"
+            await msg_repo.create_message(sender=To,
+                                          receiver=From,
+                                          body=summary,
+                                          direction="outbound",
                                           conversation_id=convo.id)
             send_sms(From, summary)
             return Response(status_code=204)
@@ -328,13 +330,12 @@ async def run_daily_digest():
         data_repo = ConversationDataRepo(session)
         all_leads = await data_repo.get_all()
 
-    per_contractor: dict[str, list] = {}
+    per_contractor: dict[int, list] = {}
     for lead in all_leads:
         per_contractor.setdefault(lead.contractor_id, []).append(lead)
 
     today = datetime.utcnow().strftime("%d/%m")
     for contractor_id, leads in per_contractor.items():
-        # you can look up contractor name/phone if desired here
         lines = [f"📊 TODAY'S LEADS ({today})"]
         complete = [l for l in leads if l.qualified]
         if complete:
@@ -357,13 +358,13 @@ async def run_daily_digest():
                     f"- {d.get('job_type','')} ({l.customer_phone}), last update {last}\n"
                     f"  Missing: {', '.join(missing)}")
         body = "\n".join(lines)
-        # you need to look up the contractor phone here; you could cache it or join
-        # for MVP, assuming contractor.phone == TWILIO_NUMBER or similar
-        send_sms("<CONTRACTOR_PHONE>", body)
+        # Lookup contractor phone by ID if needed.
+        # For now you may store a cache mapping or adjust to fetch from DB.
+        send_sms(TWILIO_NUMBER, body)
 
 
 scheduler = BackgroundScheduler()
 scheduler.add_job(lambda: asyncio.create_task(run_daily_digest()),
-                  "cron",
+                  'cron',
                   hour=18)
 scheduler.start()
