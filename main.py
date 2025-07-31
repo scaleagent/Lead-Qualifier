@@ -7,6 +7,7 @@ from datetime import datetime
 
 from fastapi import FastAPI, Depends, Form, Response
 from fastapi.responses import PlainTextResponse, FileResponse
+from sqlalchemy.future import select
 
 from openai import OpenAI
 from twilio.rest import Client
@@ -14,7 +15,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 
 # --- Database & Repos imports ---
 from repos.database import async_engine, AsyncSessionLocal
-from repos.models import Base
+from repos.models import Base, Contractor, ConversationData
 from repos.contractor_repo import ContractorRepo
 from repos.conversation_repo import ConversationRepo
 from repos.message_repo import MessageRepo
@@ -24,8 +25,10 @@ app = FastAPI()
 
 # === External API Clients ===
 openai = OpenAI(api_key=os.environ.get("OPENAI_API_KEY", ""))
-twilio_client = Client(os.environ.get("TWILIO_ACCOUNT_SID", ""),
-                       os.environ.get("TWILIO_AUTH_TOKEN", ""))
+twilio_client = Client(
+    os.environ.get("TWILIO_ACCOUNT_SID", ""),
+    os.environ.get("TWILIO_AUTH_TOKEN", ""),
+)
 TWILIO_NUMBER = os.environ.get("TWILIO_PHONE_NUMBER", "")
 
 # === Qualification Schema ===
@@ -52,29 +55,27 @@ def send_sms(to_number: str, message: str):
 
 
 async def classify_message(message_text: str, history_string: str) -> str:
-    messages = [
-        {
-            "role":
-            "system",
-            "content":
-            ("You're an AI assistant for a trades business. Classify messages as:\n"
-             "- NEW: a new job request\n"
-             "- CONTINUATION: same job\n"
-             "- UNSURE: unclear\n"
-             "If the new message mentions a new location, job, or type, classify as NEW."
-             )
-        },
-        {
-            "role": "user",
-            "content":
-            f"Message:\n{message_text}\n\nHistory:\n{history_string}"
-        },
-    ]
+    system = (
+        "You are an AI assistant for a trades business. Classify the incoming SMS as:\n"
+        "- NEW: the user is requesting a completely new job\n"
+        "- CONTINUATION: the user is continuing an existing, in-progress job\n"
+        "- UNSURE: it's unclear\n"
+        "If they mention a new location, job type, or pivot, choose NEW.")
     resp = openai.chat.completions.create(
         model="gpt-3.5-turbo",
-        messages=messages,
+        messages=[
+            {
+                "role": "system",
+                "content": system
+            },
+            {
+                "role":
+                "user",
+                "content":
+                f"Message:\n{message_text}\n\nHistory:\n{history_string}"
+            },
+        ],
         temperature=0,
-        top_p=1,
         max_tokens=50,
     )
     return resp.choices[0].message.content.strip().upper()
@@ -88,21 +89,19 @@ async def extract_qualification_data(history_string: str) -> dict:
         "- Do NOT guess or infer.\n"
         "- Put all other customer comments into 'notes'.\n"
         "Respond ONLY with a JSON object with exactly these six keys.")
-    msgs = [
-        {
-            "role": "system",
-            "content": system_prompt
-        },
-        {
-            "role": "user",
-            "content": f"Conversation:\n{history_string}"
-        },
-    ]
     resp = openai.chat.completions.create(
         model="gpt-3.5-turbo",
-        messages=msgs,
+        messages=[
+            {
+                "role": "system",
+                "content": system_prompt
+            },
+            {
+                "role": "user",
+                "content": f"Conversation:\n{history_string}"
+            },
+        ],
         temperature=0,
-        top_p=1,
         max_tokens=300,
     )
     try:
@@ -119,24 +118,22 @@ async def apply_correction_data(current: dict, correction: str) -> dict:
     system_prompt = (
         "You are a JSON assistant. Given existing job data and a user's correction, "
         "return the updated JSON with the same six keys only.")
-    user_prompt = (f"Existing data: {json.dumps(current)}\n"
-                   f"Correction: {correction}\n"
-                   "Respond ONLY with the full updated JSON.")
-    msgs = [
-        {
-            "role": "system",
-            "content": system_prompt
-        },
-        {
-            "role": "user",
-            "content": user_prompt
-        },
-    ]
     resp = openai.chat.completions.create(
         model="gpt-3.5-turbo",
-        messages=msgs,
+        messages=[
+            {
+                "role": "system",
+                "content": system_prompt
+            },
+            {
+                "role":
+                "user",
+                "content": (f"Existing data: {json.dumps(current)}\n"
+                            f"Correction: {correction}\n"
+                            "Respond ONLY with the full updated JSON."),
+            },
+        ],
         temperature=0,
-        top_p=1,
         max_tokens=300,
     )
     try:
@@ -186,18 +183,15 @@ async def sms_webhook(
         Body: str = Form(...),
         session=Depends(get_session),
 ):
-    # Normalize inputs and debug
-    From = From.strip()
-    To = To.strip()
-    Body = Body.strip()
-    print(f"🔔 raw incoming From=`{From}`, To=`{To}`, Body=`{Body}`")
+    From, To, Body = From.strip(), To.strip(), Body.strip()
+    print(f"🔔 Incoming SMS From={From}, To={To}, Body={Body!r}")
 
     contractor_repo = ContractorRepo(session)
     conv_repo = ConversationRepo(session)
     msg_repo = MessageRepo(session)
     data_repo = ConversationDataRepo(session)
 
-    # Identify sender as contractor
+    # 1) Contractor-initiated "reach out" flow
     contractor = await contractor_repo.get_by_phone(From)
     if contractor:
         m = re.match(r'^\s*reach out to (\+44\d{9,})\s*$', Body, re.IGNORECASE)
@@ -205,11 +199,10 @@ async def sms_webhook(
             customer_phone = m.group(1)
             convo = await conv_repo.create_conversation(
                 contractor_id=contractor.id, customer_phone=customer_phone)
+            # First ask ONLY job type
             intro = (
-                f"Hi! I’m {contractor.name}’s scheduling assistant. "
-                "To get you a quote, could you share your job type and property type? "
-                "If you already told your contractor some details, please repeat them."
-            )
+                f"Hi! I’m {contractor.name}’s assistant. "
+                "To get started, please tell me the type of job you need.")
             await msg_repo.create_message(sender=From,
                                           receiver=customer_phone,
                                           body=intro,
@@ -218,10 +211,77 @@ async def sms_webhook(
             send_sms(customer_phone, intro)
         return Response(status_code=204)
 
-    # Otherwise customer message
-    old_convo = await conv_repo.get_active_by_customer(From)
-    if not old_convo:
+    # 2) Customer-initiated (cold text) flow
+    # Find the contractor by matching the Twilio number
+    all_ct = await session.execute(select(Contractor))
+    contractor = all_ct.scalars().first()
+    if not contractor:
+        print("⚠️ No contractor found; dropping SMS.")
         return Response(status_code=204)
+
+    # Always fetch recent history for classification
+    recent = await msg_repo.get_recent_messages(customer=From,
+                                                contractor=TWILIO_NUMBER,
+                                                limit=10)
+    history = "\n".join(f"{'Customer' if d=='inbound' else 'AI'}: {b}"
+                        for d, b in recent)
+    cls = await classify_message(Body, history)
+    print(f"🧠 Classification: {cls}")
+
+    # UNSURE → clarify with job_type context if available
+    if cls == "UNSURE":
+        # Find the active convo and its job title
+        old_convo = await conv_repo.get_active_conversation(
+            contractor_id=contractor.id, customer_phone=From)
+        job_type = ""
+        if old_convo:
+            cd = await session.get(ConversationData, old_convo.id)
+            if cd:
+                job_type = cd.job_title or cd.data_json.get("job_type", "")
+        if job_type:
+            prompt = f"Is this about your previous “{job_type}” job or a new one?"
+        else:
+            prompt = "Is this about your previous job or a new one?"
+        await msg_repo.create_message(sender=To,
+                                      receiver=From,
+                                      body=prompt,
+                                      direction="outbound",
+                                      conversation_id=None)
+        send_sms(From, prompt)
+        return Response(status_code=204)
+
+    # NEW → start fresh conversation, first ask job type
+    if cls == "NEW":
+        convo = await conv_repo.create_conversation(
+            contractor_id=contractor.id, customer_phone=From)
+        intro = (f"Hi! I’m {contractor.name}’s assistant. "
+                 "To get started, please tell me the type of job you need.")
+        await msg_repo.create_message(sender=To,
+                                      receiver=From,
+                                      body=intro,
+                                      direction="outbound",
+                                      conversation_id=convo.id)
+        send_sms(From, intro)
+        return Response(status_code=204)
+
+    # CONTINUATION → resume existing, or NEW if none exists
+    old_convo = await conv_repo.get_active_conversation(
+        contractor_id=contractor.id, customer_phone=From)
+    if not old_convo:
+        # no active convo to continue → treat as NEW
+        convo = await conv_repo.create_conversation(
+            contractor_id=contractor.id, customer_phone=From)
+        intro = (f"Hi! I’m {contractor.name}’s assistant. "
+                 "To get started, please tell me the type of job you need.")
+        await msg_repo.create_message(sender=To,
+                                      receiver=From,
+                                      body=intro,
+                                      direction="outbound",
+                                      conversation_id=convo.id)
+        send_sms(From, intro)
+        return Response(status_code=204)
+
+    # At this point: CONTINUATION + active convo → qualification flow
     convo = old_convo
     contractor_id = convo.contractor_id
 
@@ -249,10 +309,14 @@ async def sms_webhook(
     # Prompt missing fields
     missing = [k for k in REQUIRED_FIELDS if not data[k]]
     if missing:
-        nxt = missing[:2]
-        labels = [f.replace("_", " ") for f in nxt]
-        ask = (f"Please provide your {labels[0]}." if len(labels) == 1 else
-               f"Please provide your {labels[0]} and {labels[1]}.")
+        # first ever question: job_type only
+        if all(data[k] == "" for k in REQUIRED_FIELDS):
+            ask = "Please provide your job type."
+        else:
+            nxt = missing[:2]
+            labels = [f.replace("_", " ") for f in nxt]
+            ask = (f"Please provide your {labels[0]}." if len(labels) == 1 else
+                   f"Please provide your {labels[0]} and {labels[1]}.")
         await msg_repo.create_message(sender=To,
                                       receiver=From,
                                       body=ask,
@@ -267,8 +331,8 @@ async def sms_webhook(
             f"• {f.replace('_',' ').title()}: {data[f]}"
             for f in REQUIRED_FIELDS
         ]
-        summary = "Here’s what I have so far:\n" + "\n".join(
-            bullets) + "\nIs that correct?"
+        summary = ("Here’s what I have so far:\n" + "\n".join(bullets) +
+                   "\nIs that correct?")
         await msg_repo.create_message(sender=To,
                                       receiver=From,
                                       body=summary,
@@ -306,8 +370,8 @@ async def sms_webhook(
                 f"• {f.replace('_',' ').title()}: {updated[f]}"
                 for f in REQUIRED_FIELDS
             ]
-            summary = "Got it! Here’s the updated info:\n" + "\n".join(
-                bullets) + "\nIs that correct?"
+            summary = ("Got it! Here’s the updated info:\n" +
+                       "\n".join(bullets) + "\nIs that correct?")
             await msg_repo.create_message(sender=To,
                                           receiver=From,
                                           body=summary,
@@ -358,8 +422,6 @@ async def run_daily_digest():
                     f"- {d.get('job_type','')} ({l.customer_phone}), last update {last}\n"
                     f"  Missing: {', '.join(missing)}")
         body = "\n".join(lines)
-        # Lookup contractor phone by ID if needed.
-        # For now you may store a cache mapping or adjust to fetch from DB.
         send_sms(TWILIO_NUMBER, body)
 
 
