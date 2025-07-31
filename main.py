@@ -30,6 +30,7 @@ twilio_client = Client(
     os.environ.get("TWILIO_AUTH_TOKEN", ""),
 )
 TWILIO_NUMBER = os.environ.get("TWILIO_PHONE_NUMBER", "")
+WA_SANDBOX_NUMBER = os.environ.get("WHATSAPP_SANDBOX_NUMBER", "")
 
 # === Qualification Schema ===
 REQUIRED_FIELDS = ["job_type", "property_type", "urgency", "address", "access"]
@@ -38,20 +39,24 @@ REQUIRED_FIELDS = ["job_type", "property_type", "urgency", "address", "access"]
 
 
 def send_sms(to_number: str, message: str):
+    """
+    Send a message, choosing the right sender based on channel.
+    """
+    from_number = WA_SANDBOX_NUMBER if to_number.startswith(
+        "whatsapp:") else TWILIO_NUMBER
     try:
         msg = twilio_client.messages.create(body=message,
-                                            from_=TWILIO_NUMBER,
+                                            from_=from_number,
                                             to=to_number)
-        print(f"📤 Sent SMS SID: {msg.sid} Status: {msg.status}")
+        print(
+            f"📤 Sent from {from_number!r} to {to_number!r} SID: {msg.sid} Status: {msg.status}"
+        )
     except Exception:
-        print(f"❌ Failed to send SMS to {to_number}")
+        print(f"❌ Failed to send to {to_number!r}")
         traceback.print_exc()
 
 
 async def classify_message(message_text: str, history_string: str) -> str:
-    """
-    Strictly returns exactly one of: NEW, CONTINUATION, UNSURE
-    """
     system = (
         "You are an AI assistant for a trades business. Classify the incoming SMS as exactly one of:\n"
         "NEW: user is requesting a completely new job\n"
@@ -187,19 +192,31 @@ async def sms_webhook(From: str = Form(...),
     From, To, Body = From.strip(), To.strip(), Body.strip()
     print(f"🔔 Incoming SMS From={From}, To={To}, Body={Body!r}")
 
+    # Detect channel and normalize identifier
+    is_whatsapp = From.startswith("whatsapp:")
+    if is_whatsapp:
+        raw = From.split(":", 1)[1]
+        customer_phone = f"wa:{raw}"
+        reply_to = From
+    else:
+        customer_phone = From
+        reply_to = From
+    print(
+        f"Channel={'WhatsApp' if is_whatsapp else 'SMS'}, customer_phone={customer_phone}"
+    )
+
     # Repos
     contractor_repo = ContractorRepo(session)
     conv_repo = ConversationRepo(session)
     msg_repo = MessageRepo(session)
     data_repo = ConversationDataRepo(session)
 
-    # 1) Contractor→AI “reach out”
+    # 1) Contractor-initiated “reach out”
     contractor = await contractor_repo.get_by_phone(From)
     if contractor:
         m = re.match(r'^\s*reach out to (\+44\d{9,})\s*$', Body, re.IGNORECASE)
         if m:
             customer = m.group(1)
-            # close any stray open convos for that customer
             old = await conv_repo.get_active_conversation(
                 contractor.id, customer)
             if old:
@@ -207,59 +224,54 @@ async def sms_webhook(From: str = Form(...),
             convo = await conv_repo.create_conversation(
                 contractor_id=contractor.id, customer_phone=customer)
             intro = f"Hi! I’m {contractor.name}’s assistant. To get started, please tell me the type of job you need."
-            # Log as AI→customer under TWILIO_NUMBER
             await msg_repo.create_message(sender=TWILIO_NUMBER,
                                           receiver=customer,
                                           body=intro,
                                           direction="outbound",
                                           conversation_id=convo.id)
-            send_sms(customer, intro)
+            send_sms(reply_to, intro)
         return Response(status_code=204)
 
     # 2) Customer→AI flow
-    # identify your contractor (single-Twilio setup)
     result = await session.execute(select(Contractor))
     contractor = result.scalars().first()
     if not contractor:
         print("⚠️ No contractor found; dropping SMS.")
         return Response(status_code=204)
 
-    # fetch any active convo for this customer
-    old_convo = await conv_repo.get_active_conversation(contractor.id, From)
+    old_convo = await conv_repo.get_active_conversation(
+        contractor.id, customer_phone)
 
-    # 3) CONFIRMING or COLLECTING_NOTES priorities
+    # 3) CONFIRMING / COLLECTING_NOTES
     if old_convo and old_convo.status in ("CONFIRMING", "COLLECTING_NOTES"):
-        # log the inbound
-        await msg_repo.create_message(sender=From,
+        await msg_repo.create_message(sender=customer_phone,
                                       receiver=TWILIO_NUMBER,
                                       body=Body,
                                       direction="inbound",
                                       conversation_id=old_convo.id)
-
-        # CONFIRMING: accept or correct
         if old_convo.status == "CONFIRMING":
             if is_affirmative(Body):
                 follow = (
                     "Thanks! If there’s any other important info—parking, pets, special access—"
                     "just reply here. When you’re done, reply “No”.")
                 await msg_repo.create_message(sender=TWILIO_NUMBER,
-                                              receiver=From,
+                                              receiver=reply_to,
                                               body=follow,
                                               direction="outbound",
                                               conversation_id=old_convo.id)
-                send_sms(From, follow)
+                send_sms(reply_to, follow)
                 old_convo.status = "COLLECTING_NOTES"
                 await session.commit()
             else:
-                # correction branch
                 full = await msg_repo.get_all_conversation_messages(
                     old_convo.id)
                 hist = "\n".join(f"{'Customer' if d=='inbound' else 'AI'}: {b}"
                                  for d, b in full)
                 data = await extract_qualification_data(hist)
                 updated = await apply_correction_data(data, Body)
-                await data_repo.upsert(old_convo.id, contractor.id, From,
-                                       updated, is_qualified(updated),
+                await data_repo.upsert(old_convo.id, contractor.id,
+                                       customer_phone, updated,
+                                       is_qualified(updated),
                                        updated.get("job_type"))
                 bullets = [
                     f"• {f.replace('_',' ').title()}: {updated[f]}"
@@ -268,23 +280,21 @@ async def sms_webhook(From: str = Form(...),
                 summary = "Got it! Here’s the updated info:\n" + "\n".join(
                     bullets) + "\nIs that correct?"
                 await msg_repo.create_message(sender=TWILIO_NUMBER,
-                                              receiver=From,
+                                              receiver=reply_to,
                                               body=summary,
                                               direction="outbound",
                                               conversation_id=old_convo.id)
-                send_sms(From, summary)
+                send_sms(reply_to, summary)
             return Response(status_code=204)
-
-        # COLLECTING_NOTES: append until user says “No”
         if old_convo.status == "COLLECTING_NOTES":
             if is_negative(Body):
                 closing = "Great—thanks! I’ll pass this along to your contractor. ✅"
                 await msg_repo.create_message(sender=TWILIO_NUMBER,
-                                              receiver=From,
+                                              receiver=reply_to,
                                               body=closing,
                                               direction="outbound",
                                               conversation_id=old_convo.id)
-                send_sms(From, closing)
+                send_sms(reply_to, closing)
                 await conv_repo.close_conversation(old_convo.id)
             else:
                 cd: ConversationData = await session.get(
@@ -296,23 +306,21 @@ async def sms_webhook(From: str = Form(...),
                 await session.commit()
                 prompt = "Anything else to add? If not, reply “No”."
                 await msg_repo.create_message(sender=TWILIO_NUMBER,
-                                              receiver=From,
+                                              receiver=reply_to,
                                               body=prompt,
                                               direction="outbound",
                                               conversation_id=old_convo.id)
-                send_sms(From, prompt)
+                send_sms(reply_to, prompt)
             return Response(status_code=204)
 
-    # 4) QUALIFYING: assemble last 10 between customer↔AI
-    recent = await msg_repo.get_recent_messages(customer=From,
+    # 4) QUALIFYING / pivot detection
+    recent = await msg_repo.get_recent_messages(customer=customer_phone,
                                                 contractor=TWILIO_NUMBER,
                                                 limit=10)
     history = "\n".join(f"{'Customer' if d=='inbound' else 'AI'}: {b}"
                         for d, b in recent)
     cls = await classify_message(Body, history)
     print(f"🧠 Classification: {cls}")
-
-    # UNSURE → clarify with context
     if cls == "UNSURE":
         job = ""
         if old_convo:
@@ -321,56 +329,50 @@ async def sms_webhook(From: str = Form(...),
             job = cd.job_title or cd.data_json.get("job_type", "")
         prompt = f"Is this about your previous “{job}” job or a new one?" if job else "Is this about your previous job or a new one?"
         await msg_repo.create_message(sender=TWILIO_NUMBER,
-                                      receiver=From,
+                                      receiver=reply_to,
                                       body=prompt,
                                       direction="outbound",
                                       conversation_id=None)
-        send_sms(From, prompt)
+        send_sms(reply_to, prompt)
         return Response(status_code=204)
-
-    # NEW → close any active and start fresh
     if cls == "NEW":
         if old_convo:
             await conv_repo.close_conversation(old_convo.id)
         convo = await conv_repo.create_conversation(
-            contractor_id=contractor.id, customer_phone=From)
+            contractor_id=contractor.id, customer_phone=customer_phone)
         intro = f"Hi! I’m {contractor.name}’s assistant. To get started, please tell me the type of job you need."
         await msg_repo.create_message(sender=TWILIO_NUMBER,
-                                      receiver=From,
+                                      receiver=reply_to,
                                       body=intro,
                                       direction="outbound",
                                       conversation_id=convo.id)
-        send_sms(From, intro)
+        send_sms(reply_to, intro)
         return Response(status_code=204)
-
-    # CONTINUATION → fall back into existing
     if cls == "CONTINUATION":
         if not old_convo:
             convo = await conv_repo.create_conversation(
-                contractor_id=contractor.id, customer_phone=From)
+                contractor_id=contractor.id, customer_phone=customer_phone)
             intro = f"Hi! I’m {contractor.name}’s assistant. To get started, please tell me the type of job you need."
             await msg_repo.create_message(sender=TWILIO_NUMBER,
-                                          receiver=From,
+                                          receiver=reply_to,
                                           body=intro,
                                           direction="outbound",
                                           conversation_id=convo.id)
-            send_sms(From, intro)
+            send_sms(reply_to, intro)
             return Response(status_code=204)
         convo = old_convo
-
-    # 5) Continue qualification loop
-    await msg_repo.create_message(sender=From,
+    # 5) Continue qualification
+    await msg_repo.create_message(sender=customer_phone,
                                   receiver=TWILIO_NUMBER,
                                   body=Body,
                                   direction="inbound",
                                   conversation_id=convo.id)
-    full = await msg_repo.get_all_conversation_messages(convo.id)
+    full_msgs = await msg_repo.get_all_conversation_messages(convo.id)
     history = "\n".join(f"{'Customer' if d=='inbound' else 'AI'}: {b}"
-                        for d, b in full)
+                        for d, b in full_msgs)
     data = await extract_qualification_data(history)
-    await data_repo.upsert(convo.id, contractor.id, From, data,
+    await data_repo.upsert(convo.id, contractor.id, customer_phone, data,
                            is_qualified(data), data.get("job_type"))
-
     missing = [k for k in REQUIRED_FIELDS if not data[k]]
     if missing:
         ask = "Please provide your job type." if all(
@@ -379,13 +381,12 @@ async def sms_webhook(From: str = Form(...),
                 ("" if len(missing) == 1 else
                  f" and {missing[1].replace('_',' ')}"))
         await msg_repo.create_message(sender=TWILIO_NUMBER,
-                                      receiver=From,
+                                      receiver=reply_to,
                                       body=ask,
                                       direction="outbound",
                                       conversation_id=convo.id)
-        send_sms(From, ask)
+        send_sms(reply_to, ask)
         return Response(status_code=204)
-
     if convo.status == "QUALIFYING":
         bullets = [
             f"• {f.replace('_',' ').title()}: {data[f]}"
@@ -394,15 +395,14 @@ async def sms_webhook(From: str = Form(...),
         summary = "Here’s what I have so far:\n" + "\n".join(
             bullets) + "\nIs that correct?"
         await msg_repo.create_message(sender=TWILIO_NUMBER,
-                                      receiver=From,
+                                      receiver=reply_to,
                                       body=summary,
                                       direction="outbound",
                                       conversation_id=convo.id)
-        send_sms(From, summary)
+        send_sms(reply_to, summary)
         convo.status = "CONFIRMING"
         await session.commit()
         return Response(status_code=204)
-
     return Response(status_code=204)
 
 
@@ -428,25 +428,3 @@ async def run_daily_digest():
             for l in comp:
                 d = l.data_json
                 url = f"https://{os.environ.get('REPLIT_DOMAIN')}/pdf/{l.conversation_id}"
-                lines.append(
-                    f"- {d.get('job_type','')} | {d.get('property_type','')} | {d.get('urgency','')} | {d.get('address','')}\n  View: {url}"
-                )
-        inc = [l for l in leads if not l.qualified]
-        if inc:
-            lines.append("⏸️ Incomplete:")
-            for l in inc:
-                d = l.data_json
-                miss = [k for k in REQUIRED_FIELDS if not d.get(k)]
-                last = l.last_updated.strftime("%d/%m %H:%M")
-                lines.append(
-                    f"- {d.get('job_type','')} ({l.customer_phone}), last update {last}\n  Missing: {', '.join(miss)}"
-                )
-        body = "\n".join(lines)
-        send_sms(TWILIO_NUMBER, body)
-
-
-scheduler = BackgroundScheduler()
-scheduler.add_job(lambda: asyncio.create_task(run_daily_digest()),
-                  'cron',
-                  hour=18)
-scheduler.start()
