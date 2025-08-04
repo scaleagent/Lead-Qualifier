@@ -16,7 +16,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 
 # --- Database & Repos imports ---
 from repos.database import async_engine, AsyncSessionLocal
-from repos.models import Base, Contractor, ConversationData
+from repos.models import Base, Contractor, ConversationData, Message
 from repos.contractor_repo import ContractorRepo
 from repos.conversation_repo import ConversationRepo
 from repos.message_repo import MessageRepo
