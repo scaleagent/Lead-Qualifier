@@ -203,6 +203,11 @@ def read_root():
     return "✅ SMS-Lead-Qual API is running."
 
 
+async def get_session():
+    async with AsyncSessionLocal() as session:
+        yield session
+
+
 @app.get("/contractors", response_class=PlainTextResponse)
 async def list_contractors(session=Depends(get_session)):
     """Debug endpoint to view stored contractor profiles"""
@@ -222,11 +227,6 @@ async def list_contractors(session=Depends(get_session)):
         result.append("  " + "-" * 30)
 
     return "\n".join(result)
-
-
-async def get_session():
-    async with AsyncSessionLocal() as session:
-        yield session
 
 
 @app.post("/sms", response_class=PlainTextResponse)
