@@ -3,6 +3,7 @@ import json
 import traceback
 import asyncio
 import re
+import logging
 from datetime import datetime
 
 from fastapi import FastAPI, Depends, Form, Response
@@ -20,6 +21,10 @@ from repos.contractor_repo import ContractorRepo
 from repos.conversation_repo import ConversationRepo
 from repos.message_repo import MessageRepo
 from repos.conversation_data_repo import ConversationDataRepo
+
+# Set up clean logging format
+logging.basicConfig(format='%(asctime)s [%(levelname)s] %(message)s',
+                    level=logging.INFO)
 
 app = FastAPI()
 
@@ -198,6 +203,27 @@ def read_root():
     return "✅ SMS-Lead-Qual API is running."
 
 
+@app.get("/contractors", response_class=PlainTextResponse)
+async def list_contractors(session=Depends(get_session)):
+    """Debug endpoint to view stored contractor profiles"""
+    contractor_repo = ContractorRepo(session)
+    contractors = await contractor_repo.get_all()
+
+    if not contractors:
+        return "❌ No contractors found in database"
+
+    result = ["📋 STORED CONTRACTORS:"]
+    for c in contractors:
+        result.append(f"  ID: {c.id}")
+        result.append(f"  Name: {c.name}")
+        result.append(f"  Phone: {c.phone}")
+        result.append(f"  Address: {c.address or 'Not set'}")
+        result.append(f"  Created: {c.created_at}")
+        result.append("  " + "-" * 30)
+
+    return "\n".join(result)
+
+
 async def get_session():
     async with AsyncSessionLocal() as session:
         yield session
@@ -209,11 +235,18 @@ async def sms_webhook(From: str = Form(...),
                       Body: str = Form(...),
                       session=Depends(get_session)):
     From, To, Body = From.strip(), To.strip(), Body.strip()
-    print(f"🔔 Incoming From={From}, To={To}, Body={Body!r}")
+    print(f"🔔 INCOMING SMS/WhatsApp:")
+    print(f"   From: {From}")
+    print(f"   To: {To}")
+    print(f"   Body: {Body!r}")
 
     # Unified channel detection and normalization
     is_whatsapp = From.startswith("whatsapp:")
     customer_phone = From.split(":", 1)[1] if is_whatsapp else From
+
+    print(f"🔍 PARSED:")
+    print(f"   is_whatsapp: {is_whatsapp}")
+    print(f"   customer_phone: {customer_phone}")
 
     # Initialize repositories
     contractor_repo = ContractorRepo(session)
@@ -224,21 +257,27 @@ async def sms_webhook(From: str = Form(...),
     # 1) Handle contractor-initiated "reach out" commands
     contractor = await contractor_repo.get_by_phone(customer_phone)
     if contractor:
+        print(
+            f"✅ CONTRACTOR IDENTIFIED: {contractor.name} (ID: {contractor.id})"
+        )
         # Match both UK and international phone numbers
         m = re.match(r'^\s*reach out to (\+\d{10,15})\s*$', Body,
                      re.IGNORECASE)
         if m:
             target_phone = m.group(1)
+            print(f"📞 REACH OUT COMMAND to: {target_phone}")
 
             # Close any existing conversation for this customer
             old_convo = await conv_repo.get_active_conversation(
                 contractor.id, target_phone)
             if old_convo:
+                print(f"🔄 CLOSING existing conversation: {old_convo.id}")
                 await conv_repo.close_conversation(old_convo.id)
 
             # Create new conversation
             convo = await conv_repo.create_conversation(
                 contractor_id=contractor.id, customer_phone=target_phone)
+            print(f"🆕 CREATED new conversation: {convo.id}")
 
             # Send introduction message
             intro = (
@@ -252,10 +291,13 @@ async def sms_webhook(From: str = Form(...),
                 direction="outbound",
                 conversation_id=convo.id)
             send_message(target_phone, intro, is_whatsapp)
+            print(f"📤 SENT intro message to customer: {target_phone}")
 
         return Response(status_code=204)
 
     # 2) Handle customer-initiated messages
+    print(f"👤 CUSTOMER MESSAGE from: {customer_phone}")
+
     # Get the first available contractor (single-contractor setup)
     result = await session.execute(select(Contractor))
     contractor = result.scalars().first()
@@ -263,12 +305,22 @@ async def sms_webhook(From: str = Form(...),
         print("⚠️ No contractor found; dropping message.")
         return Response(status_code=204)
 
+    print(f"🏢 USING contractor: {contractor.name} (ID: {contractor.id})")
+
     # Get any active conversation for this customer
     old_convo = await conv_repo.get_active_conversation(
         contractor.id, customer_phone)
+    if old_convo:
+        print(
+            f"💬 FOUND active conversation: {old_convo.id} (status: {old_convo.status})"
+        )
+    else:
+        print(f"❌ NO active conversation found for customer: {customer_phone}")
 
     # 3) Handle CONFIRMING and COLLECTING_NOTES states with priority
     if old_convo and old_convo.status in ("CONFIRMING", "COLLECTING_NOTES"):
+        print(f"🔄 HANDLING {old_convo.status} state")
+
         # Log the incoming message
         await msg_repo.create_message(sender=customer_phone,
                                       receiver=To,
@@ -279,6 +331,7 @@ async def sms_webhook(From: str = Form(...),
         # CONFIRMING state: handle confirmation or corrections
         if old_convo.status == "CONFIRMING":
             if is_affirmative(Body):
+                print("✅ CONFIRMED - moving to notes collection")
                 # Move to collecting additional notes
                 follow = (
                     "Thanks! If there's any other important info—parking, pets, special access—"
@@ -292,6 +345,7 @@ async def sms_webhook(From: str = Form(...),
                 old_convo.status = "COLLECTING_NOTES"
                 await session.commit()
             else:
+                print("🔧 CORRECTIONS needed")
                 # Handle corrections
                 full_msgs = await msg_repo.get_all_conversation_messages(
                     old_convo.id)
@@ -328,6 +382,7 @@ async def sms_webhook(From: str = Form(...),
         # COLLECTING_NOTES state: collect additional information
         if old_convo.status == "COLLECTING_NOTES":
             if is_negative(Body):
+                print("✅ COMPLETED - closing conversation")
                 # Complete the conversation
                 closing = "Great—thanks! I'll pass this along to your contractor. ✅"
                 await msg_repo.create_message(sender=To,
@@ -338,6 +393,7 @@ async def sms_webhook(From: str = Form(...),
                 send_message(customer_phone, closing, is_whatsapp)
                 await conv_repo.close_conversation(old_convo.id)
             else:
+                print("📝 ADDING to notes")
                 # Append to notes
                 cd: ConversationData = await session.get(
                     ConversationData, old_convo.id)
@@ -359,16 +415,27 @@ async def sms_webhook(From: str = Form(...),
             return Response(status_code=204)
 
     # 4) Message classification for new/continuation logic
+    print(f"🧠 STARTING message classification...")
+
     recent_msgs = await msg_repo.get_recent_messages(customer=customer_phone,
                                                      contractor=To,
                                                      limit=10)
+
+    print(f"🔍 CLASSIFICATION DEBUG:")
+    print(f"   Querying with customer={customer_phone}, contractor={To}")
+    print(f"   Found {len(recent_msgs)} recent messages")
+    print(f"   Recent messages raw: {recent_msgs}")
+
     history = "\n".join(f"{'Customer' if d=='inbound' else 'AI'}: {b}"
                         for d, b in recent_msgs)
+    print(f"   History for classification: {history!r}")
+
     classification = await classify_message(Body, history)
-    print(f"🧠 Classification: {classification}")
+    print(f"🧠 CLASSIFICATION RESULT: {classification}")
 
     # Handle UNSURE classification
     if classification == "UNSURE":
+        print("❓ UNSURE classification - asking for clarification")
         job_context = ""
         if old_convo:
             cd: ConversationData = await session.get(ConversationData,
@@ -391,11 +458,14 @@ async def sms_webhook(From: str = Form(...),
 
     # Handle NEW classification
     if classification == "NEW":
+        print("🆕 NEW classification - creating fresh conversation")
         if old_convo:
+            print(f"   Closing old conversation: {old_convo.id}")
             await conv_repo.close_conversation(old_convo.id)
 
         convo = await conv_repo.create_conversation(
             contractor_id=contractor.id, customer_phone=customer_phone)
+        print(f"   Created new conversation: {convo.id}")
 
         intro = f"Hi! I'm {contractor.name}'s assistant. To get started, please tell me the type of job you need."
 
@@ -409,7 +479,9 @@ async def sms_webhook(From: str = Form(...),
 
     # Handle CONTINUATION classification
     if classification == "CONTINUATION":
+        print("➡️ CONTINUATION classification")
         if not old_convo:
+            print("   No active convo - creating new one")
             # Create new conversation if none exists
             convo = await conv_repo.create_conversation(
                 contractor_id=contractor.id, customer_phone=customer_phone)
@@ -423,9 +495,12 @@ async def sms_webhook(From: str = Form(...),
             send_message(customer_phone, intro, is_whatsapp)
             return Response(status_code=204)
         else:
+            print(f"   Using existing conversation: {old_convo.id}")
             convo = old_convo
 
     # 5) Continue with qualification process
+    print(f"📋 CONTINUING qualification process...")
+
     # Log the incoming message
     await msg_repo.create_message(sender=customer_phone,
                                   receiver=To,
@@ -439,6 +514,8 @@ async def sms_webhook(From: str = Form(...),
                         for d, b in full_msgs)
     data = await extract_qualification_data(history)
 
+    print(f"   Extracted data: {data}")
+
     # Store/update the qualification data
     await data_repo.upsert(conversation_id=convo.id,
                            contractor_id=contractor.id,
@@ -449,6 +526,8 @@ async def sms_webhook(From: str = Form(...),
 
     # Check for missing fields and prompt accordingly
     missing = [k for k in REQUIRED_FIELDS if not data[k]]
+    print(f"   Missing fields: {missing}")
+
     if missing:
         if all(data[k] == "" for k in REQUIRED_FIELDS):
             ask = "Please provide your job type."
@@ -458,6 +537,7 @@ async def sms_webhook(From: str = Form(...),
             ask = (f"Please provide your {labels[0]}." if len(labels) == 1 else
                    f"Please provide your {labels[0]} and {labels[1]}.")
 
+        print(f"   Asking for: {ask}")
         await msg_repo.create_message(sender=To,
                                       receiver=customer_phone,
                                       body=ask,
@@ -468,6 +548,7 @@ async def sms_webhook(From: str = Form(...),
 
     # If all fields are collected and we're in QUALIFYING state, show summary
     if convo.status == "QUALIFYING":
+        print("✅ ALL FIELDS COLLECTED - showing summary")
         bullets = [
             f"• {f.replace('_',' ').title()}: {data[f]}"
             for f in REQUIRED_FIELDS
@@ -495,77 +576,22 @@ def generate_pdf(convo_id: str):
     return FileResponse(path, media_type="application/pdf")
 
 
-# === Daily Digest System ===
-async def run_daily_digest():
-    """
-    Generate and send daily digest of leads to contractors.
-    Runs automatically at 6 PM daily.
-    """
-    async with AsyncSessionLocal() as session:
-        data_repo = ConversationDataRepo(session)
-        contractor_repo = ContractorRepo(session)
-        all_leads = await data_repo.get_all()
+# === Daily Digest System (COMMENTED OUT - NOT IMPLEMENTED YET) ===
+# async def run_daily_digest():
+#     """Generate and send daily digest of leads to contractors."""
+#     pass
 
-    # Group leads by contractor
-    leads_by_contractor: dict[int, list] = {}
-    for lead in all_leads:
-        leads_by_contractor.setdefault(lead.contractor_id, []).append(lead)
-
-    today = datetime.utcnow().strftime("%d/%m")
-
-    for contractor_id, leads in leads_by_contractor.items():
-        # Get contractor info - NEED TO ADD get_by_id method to ContractorRepo
-        async with AsyncSessionLocal() as session:
-            contractor_repo = ContractorRepo(session)
-            contractor = await session.get(Contractor, contractor_id
-                                           )  # Direct SQLAlchemy call for now
-
-        if not contractor:
-            continue
-
-        lines = [f"📊 TODAY'S LEADS ({today})"]
-
-        # Complete leads
-        complete_leads = [l for l in leads if l.qualified]
-        if complete_leads:
-            lines.append("✅ Complete:")
-            for lead in complete_leads:
-                d = lead.data_json
-                pdf_url = f"https://{os.environ.get('REPLIT_DOMAIN', 'localhost')}/pdf/{lead.conversation_id}"
-                lines.append(
-                    f"- {d.get('job_type','')} | {d.get('property_type','')} | "
-                    f"{d.get('urgency','')} | {d.get('address','')}\n"
-                    f"  View: {pdf_url}")
-
-        # Incomplete leads
-        incomplete_leads = [l for l in leads if not l.qualified]
-        if incomplete_leads:
-            lines.append("⏸️ Incomplete:")
-            for lead in incomplete_leads:
-                d = lead.data_json
-                missing = [k for k in REQUIRED_FIELDS if not d.get(k)]
-                last_update = lead.last_updated.strftime("%d/%m %H:%M")
-                lines.append(
-                    f"- {d.get('job_type','')} ({lead.customer_phone}), last update {last_update}\n"
-                    f"  Missing: {', '.join(missing)}")
-
-        # Send digest to contractor
-        digest_body = "\n".join(lines)
-        contractor_phone = contractor.phone
-
-        # Send to contractor's phone (always send digest via SMS)
-        send_message(contractor_phone, digest_body, False)
-
-
-# === Background Scheduler Setup ===
-scheduler = BackgroundScheduler()
-scheduler.add_job(
-    lambda: asyncio.create_task(run_daily_digest()),
-    'cron',
-    hour=18,  # 6 PM daily
-    minute=0)
-scheduler.start()
+# === Background Scheduler Setup (COMMENTED OUT - NOT IMPLEMENTED YET) ===
+# scheduler = BackgroundScheduler()
+# scheduler.add_job(
+#     lambda: asyncio.create_task(run_daily_digest()),
+#     'cron',
+#     hour=18,  # 6 PM daily
+#     minute=0
+# )
+# scheduler.start()
 
 print("🚀 SMS Lead Qualification Bot started successfully!")
 print("📱 Supporting both SMS and WhatsApp channels")
-print("⏰ Daily digest scheduled for 6 PM")
+print("🔧 Debug mode enabled with enhanced logging")
+# print("⏰ Daily digest scheduled for 6 PM")  # Commented out
