@@ -463,7 +463,22 @@ async def sms_webhook(From: str = Form(...),
 
             return Response(status_code=204)
 
-    # 4) Message classification for new/continuation logic
+    # 4) CRITICAL FIX: Log the incoming message FIRST, then do classification
+    # This ensures the current customer message is included in classification history
+
+    # Determine which conversation to use for logging
+    conversation_for_logging = old_convo.id if old_convo else None
+
+    print(
+        f"📝 LOGGING incoming message first (conversation: {conversation_for_logging})"
+    )
+    await msg_repo.create_message(sender=customer_phone_db,
+                                  receiver=system_phone_db,
+                                  body=Body,
+                                  direction="inbound",
+                                  conversation_id=conversation_for_logging)
+
+    # Now do message classification with the current message included
     print(f"🧠 STARTING message classification...")
 
     recent_msgs = await msg_repo.get_recent_messages(
@@ -521,6 +536,21 @@ async def sms_webhook(From: str = Form(...),
         )
         print(f"   Created new conversation: {convo.id}")
 
+        # Update the message we logged earlier to link to this new conversation
+        recent_msg_result = await session.execute(
+            select(Message).where(Message.sender == customer_phone_db,
+                                  Message.receiver == system_phone_db,
+                                  Message.body == Body,
+                                  Message.direction == "inbound",
+                                  Message.conversation_id.is_(None)).order_by(
+                                      Message.timestamp.desc()).limit(1))
+        recent_msg = recent_msg_result.scalars().first()
+        if recent_msg:
+            recent_msg.conversation_id = convo.id
+            await session.commit()
+            print(
+                f"   Updated message to link to new conversation: {convo.id}")
+
         intro = f"Hi! I'm {contractor.name}'s assistant. To get started, please tell me the type of job you need."
 
         await msg_repo.create_message(sender=system_phone_db,
@@ -541,6 +571,24 @@ async def sms_webhook(From: str = Form(...),
                 contractor_id=contractor.id,
                 customer_phone=customer_phone_db  # Store with channel prefix
             )
+
+            # Update the message we logged earlier to link to this new conversation
+            # Find the message we just logged and update its conversation_id
+            recent_msg_result = await session.execute(
+                select(Message).where(
+                    Message.sender == customer_phone_db,
+                    Message.receiver == system_phone_db, Message.body == Body,
+                    Message.direction == "inbound",
+                    Message.conversation_id.is_(None)).order_by(
+                        Message.timestamp.desc()).limit(1))
+            recent_msg = recent_msg_result.scalars().first()
+            if recent_msg:
+                recent_msg.conversation_id = convo.id
+                await session.commit()
+                print(
+                    f"   Updated message to link to new conversation: {convo.id}"
+                )
+
             intro = f"Hi! I'm {contractor.name}'s assistant. To get started, please tell me the type of job you need."
 
             await msg_repo.create_message(sender=system_phone_db,
@@ -557,12 +605,8 @@ async def sms_webhook(From: str = Form(...),
     # 5) Continue with qualification process
     print(f"📋 CONTINUING qualification process...")
 
-    # Log the incoming message
-    await msg_repo.create_message(sender=customer_phone_db,
-                                  receiver=system_phone_db,
-                                  body=Body,
-                                  direction="inbound",
-                                  conversation_id=convo.id)
+    # Note: We already logged the incoming message above, so no need to log it again
+    # Just ensure we're using the right conversation
 
     # Extract qualification data from full conversation
     full_msgs = await msg_repo.get_all_conversation_messages(convo.id)
