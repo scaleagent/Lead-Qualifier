@@ -35,14 +35,22 @@ class MessageRepo:
         """
         Fetch the last `limit` messages between the two numbers, newest first.
         (Used only for classification when there's no active conversation.)
+
+        IMPORTANT: Maintains complete separation between SMS and WhatsApp.
+        - WhatsApp numbers stored as: wa:+447742001014
+        - SMS numbers stored as: +447742001014
+        - NO cross-pollination between channels
         """
-        stmt = (select(
-            Message.direction,
-            Message.body).where(((Message.sender == customer)
-                                 & (Message.receiver == contractor))
-                                | ((Message.sender == contractor)
-                                   & (Message.receiver == customer))).order_by(
-                                       Message.timestamp.desc()).limit(limit))
+        stmt = (
+            select(Message.direction, Message.body).where(
+                # Fixed: Proper parentheses and EXACT format matching only
+                # No cross-channel contamination - WhatsApp stays WhatsApp, SMS stays SMS
+                ((Message.sender == customer)
+                 & (Message.receiver == contractor))
+                | ((Message.sender == contractor)
+                   & (Message.receiver == customer))).order_by(
+                       Message.timestamp.desc()).limit(limit))
+
         result = await self.session.execute(stmt)
         rows = result.all()
         return list(reversed(rows))

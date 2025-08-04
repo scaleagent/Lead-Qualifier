@@ -41,6 +41,37 @@ WA_SANDBOX_NUMBER = os.environ.get("WHATSAPP_SANDBOX_NUMBER", "")
 REQUIRED_FIELDS = ["job_type", "property_type", "urgency", "address", "access"]
 
 
+# === Phone Number Formatting for Channel Separation ===
+def normalize_phone_for_db(phone: str, is_whatsapp: bool) -> str:
+    """
+    Normalize phone numbers for database storage with channel separation:
+    - WhatsApp: wa:+447742001014
+    - SMS: +447742001014
+
+    This ensures complete separation - same physical number = different DB identities
+    """
+    # Remove any existing whatsapp: prefix first
+    clean_phone = phone.split(":",
+                              1)[1] if phone.startswith("whatsapp:") else phone
+
+    if is_whatsapp:
+        return f"wa:{clean_phone}"
+    else:
+        return clean_phone
+
+
+def get_system_number_for_db(is_whatsapp: bool) -> str:
+    """Get the system's number in the correct format for database storage"""
+    if is_whatsapp:
+        # Remove whatsapp: prefix and add wa: prefix
+        clean_number = WA_SANDBOX_NUMBER.split(
+            ":", 1)[1] if WA_SANDBOX_NUMBER.startswith(
+                "whatsapp:") else WA_SANDBOX_NUMBER
+        return f"wa:{clean_number}"
+    else:
+        return TWILIO_NUMBER
+
+
 # === Helpers ===
 def send_message(to_number: str, message: str, is_whatsapp: bool = False):
     """
@@ -242,11 +273,17 @@ async def sms_webhook(From: str = Form(...),
 
     # Unified channel detection and normalization
     is_whatsapp = From.startswith("whatsapp:")
-    customer_phone = From.split(":", 1)[1] if is_whatsapp else From
+    from_phone_clean = From.split(":", 1)[1] if is_whatsapp else From
+
+    # CRITICAL: Normalize phone numbers for database with channel separation
+    customer_phone_db = normalize_phone_for_db(from_phone_clean, is_whatsapp)
+    system_phone_db = get_system_number_for_db(is_whatsapp)
 
     print(f"🔍 PARSED:")
     print(f"   is_whatsapp: {is_whatsapp}")
-    print(f"   customer_phone: {customer_phone}")
+    print(f"   from_phone_clean: {from_phone_clean}")
+    print(f"   customer_phone_db: {customer_phone_db}")
+    print(f"   system_phone_db: {system_phone_db}")
 
     # Initialize repositories
     contractor_repo = ContractorRepo(session)
@@ -255,7 +292,8 @@ async def sms_webhook(From: str = Form(...),
     data_repo = ConversationDataRepo(session)
 
     # 1) Handle contractor-initiated "reach out" commands
-    contractor = await contractor_repo.get_by_phone(customer_phone)
+    # NOTE: Contractors are stored with clean phone numbers (no wa: prefix)
+    contractor = await contractor_repo.get_by_phone(from_phone_clean)
     if contractor:
         print(
             f"✅ CONTRACTOR IDENTIFIED: {contractor.name} (ID: {contractor.id})"
@@ -264,19 +302,25 @@ async def sms_webhook(From: str = Form(...),
         m = re.match(r'^\s*reach out to (\+\d{10,15})\s*$', Body,
                      re.IGNORECASE)
         if m:
-            target_phone = m.group(1)
-            print(f"📞 REACH OUT COMMAND to: {target_phone}")
+            target_phone_clean = m.group(1)
+            target_phone_db = normalize_phone_for_db(target_phone_clean,
+                                                     is_whatsapp)
+            print(
+                f"📞 REACH OUT COMMAND to: {target_phone_clean} (DB: {target_phone_db})"
+            )
 
-            # Close any existing conversation for this customer
+            # Close any existing conversation for this customer ON THIS CHANNEL
             old_convo = await conv_repo.get_active_conversation(
-                contractor.id, target_phone)
+                contractor.id, target_phone_db)
             if old_convo:
                 print(f"🔄 CLOSING existing conversation: {old_convo.id}")
                 await conv_repo.close_conversation(old_convo.id)
 
             # Create new conversation
             convo = await conv_repo.create_conversation(
-                contractor_id=contractor.id, customer_phone=target_phone)
+                contractor_id=contractor.id,
+                customer_phone=target_phone_db  # Store with channel prefix
+            )
             print(f"🆕 CREATED new conversation: {convo.id}")
 
             # Send introduction message
@@ -285,18 +329,19 @@ async def sms_webhook(From: str = Form(...),
                 "To get started, please tell me the type of job you need.")
 
             await msg_repo.create_message(
-                sender=To,  # Our system number
-                receiver=target_phone,
+                sender=system_phone_db,  # Store with channel prefix
+                receiver=target_phone_db,  # Store with channel prefix
                 body=intro,
                 direction="outbound",
                 conversation_id=convo.id)
-            send_message(target_phone, intro, is_whatsapp)
-            print(f"📤 SENT intro message to customer: {target_phone}")
+            send_message(target_phone_clean, intro,
+                         is_whatsapp)  # Send with clean phone
+            print(f"📤 SENT intro message to customer: {target_phone_clean}")
 
         return Response(status_code=204)
 
     # 2) Handle customer-initiated messages
-    print(f"👤 CUSTOMER MESSAGE from: {customer_phone}")
+    print(f"👤 CUSTOMER MESSAGE from: {customer_phone_db}")
 
     # Get the first available contractor (single-contractor setup)
     result = await session.execute(select(Contractor))
@@ -307,23 +352,25 @@ async def sms_webhook(From: str = Form(...),
 
     print(f"🏢 USING contractor: {contractor.name} (ID: {contractor.id})")
 
-    # Get any active conversation for this customer
+    # Get any active conversation for this customer ON THIS CHANNEL
     old_convo = await conv_repo.get_active_conversation(
-        contractor.id, customer_phone)
+        contractor.id, customer_phone_db)
     if old_convo:
         print(
             f"💬 FOUND active conversation: {old_convo.id} (status: {old_convo.status})"
         )
     else:
-        print(f"❌ NO active conversation found for customer: {customer_phone}")
+        print(
+            f"❌ NO active conversation found for customer: {customer_phone_db}"
+        )
 
     # 3) Handle CONFIRMING and COLLECTING_NOTES states with priority
     if old_convo and old_convo.status in ("CONFIRMING", "COLLECTING_NOTES"):
         print(f"🔄 HANDLING {old_convo.status} state")
 
         # Log the incoming message
-        await msg_repo.create_message(sender=customer_phone,
-                                      receiver=To,
+        await msg_repo.create_message(sender=customer_phone_db,
+                                      receiver=system_phone_db,
                                       body=Body,
                                       direction="inbound",
                                       conversation_id=old_convo.id)
@@ -336,12 +383,12 @@ async def sms_webhook(From: str = Form(...),
                 follow = (
                     "Thanks! If there's any other important info—parking, pets, special access—"
                     "just reply here. When you're done, reply 'No'.")
-                await msg_repo.create_message(sender=To,
-                                              receiver=customer_phone,
+                await msg_repo.create_message(sender=system_phone_db,
+                                              receiver=customer_phone_db,
                                               body=follow,
                                               direction="outbound",
                                               conversation_id=old_convo.id)
-                send_message(customer_phone, follow, is_whatsapp)
+                send_message(from_phone_clean, follow, is_whatsapp)
                 old_convo.status = "COLLECTING_NOTES"
                 await session.commit()
             else:
@@ -355,12 +402,14 @@ async def sms_webhook(From: str = Form(...),
                 data = await extract_qualification_data(history)
                 updated = await apply_correction_data(data, Body)
 
-                await data_repo.upsert(conversation_id=old_convo.id,
-                                       contractor_id=contractor.id,
-                                       customer_phone=customer_phone,
-                                       data_dict=updated,
-                                       qualified=is_qualified(updated),
-                                       job_title=updated.get("job_type"))
+                await data_repo.upsert(
+                    conversation_id=old_convo.id,
+                    contractor_id=contractor.id,
+                    customer_phone=
+                    customer_phone_db,  # Store with channel prefix
+                    data_dict=updated,
+                    qualified=is_qualified(updated),
+                    job_title=updated.get("job_type"))
 
                 # Show updated summary
                 bullets = [
@@ -370,12 +419,12 @@ async def sms_webhook(From: str = Form(...),
                 summary = "Got it! Here's the updated info:\n" + "\n".join(
                     bullets) + "\nIs that correct?"
 
-                await msg_repo.create_message(sender=To,
-                                              receiver=customer_phone,
+                await msg_repo.create_message(sender=system_phone_db,
+                                              receiver=customer_phone_db,
                                               body=summary,
                                               direction="outbound",
                                               conversation_id=old_convo.id)
-                send_message(customer_phone, summary, is_whatsapp)
+                send_message(from_phone_clean, summary, is_whatsapp)
 
             return Response(status_code=204)
 
@@ -385,12 +434,12 @@ async def sms_webhook(From: str = Form(...),
                 print("✅ COMPLETED - closing conversation")
                 # Complete the conversation
                 closing = "Great—thanks! I'll pass this along to your contractor. ✅"
-                await msg_repo.create_message(sender=To,
-                                              receiver=customer_phone,
+                await msg_repo.create_message(sender=system_phone_db,
+                                              receiver=customer_phone_db,
                                               body=closing,
                                               direction="outbound",
                                               conversation_id=old_convo.id)
-                send_message(customer_phone, closing, is_whatsapp)
+                send_message(from_phone_clean, closing, is_whatsapp)
                 await conv_repo.close_conversation(old_convo.id)
             else:
                 print("📝 ADDING to notes")
@@ -405,24 +454,27 @@ async def sms_webhook(From: str = Form(...),
                     await session.commit()
 
                 prompt = "Anything else to add? If not, reply 'No'."
-                await msg_repo.create_message(sender=To,
-                                              receiver=customer_phone,
+                await msg_repo.create_message(sender=system_phone_db,
+                                              receiver=customer_phone_db,
                                               body=prompt,
                                               direction="outbound",
                                               conversation_id=old_convo.id)
-                send_message(customer_phone, prompt, is_whatsapp)
+                send_message(from_phone_clean, prompt, is_whatsapp)
 
             return Response(status_code=204)
 
     # 4) Message classification for new/continuation logic
     print(f"🧠 STARTING message classification...")
 
-    recent_msgs = await msg_repo.get_recent_messages(customer=customer_phone,
-                                                     contractor=To,
-                                                     limit=10)
+    recent_msgs = await msg_repo.get_recent_messages(
+        customer=customer_phone_db,  # Use DB format with channel prefix
+        contractor=system_phone_db,  # Use DB format with channel prefix
+        limit=10)
 
     print(f"🔍 CLASSIFICATION DEBUG:")
-    print(f"   Querying with customer={customer_phone}, contractor={To}")
+    print(
+        f"   Querying with customer={customer_phone_db}, contractor={system_phone_db}"
+    )
     print(f"   Found {len(recent_msgs)} recent messages")
     print(f"   Recent messages raw: {recent_msgs}")
 
@@ -448,12 +500,12 @@ async def sms_webhook(From: str = Form(...),
             job_context else "Is this about your previous job or a new one?")
 
         await msg_repo.create_message(
-            sender=To,
-            receiver=customer_phone,
+            sender=system_phone_db,
+            receiver=customer_phone_db,
             body=prompt,
             direction="outbound",
             conversation_id=old_convo.id if old_convo else None)
-        send_message(customer_phone, prompt, is_whatsapp)
+        send_message(from_phone_clean, prompt, is_whatsapp)
         return Response(status_code=204)
 
     # Handle NEW classification
@@ -464,17 +516,19 @@ async def sms_webhook(From: str = Form(...),
             await conv_repo.close_conversation(old_convo.id)
 
         convo = await conv_repo.create_conversation(
-            contractor_id=contractor.id, customer_phone=customer_phone)
+            contractor_id=contractor.id,
+            customer_phone=customer_phone_db  # Store with channel prefix
+        )
         print(f"   Created new conversation: {convo.id}")
 
         intro = f"Hi! I'm {contractor.name}'s assistant. To get started, please tell me the type of job you need."
 
-        await msg_repo.create_message(sender=To,
-                                      receiver=customer_phone,
+        await msg_repo.create_message(sender=system_phone_db,
+                                      receiver=customer_phone_db,
                                       body=intro,
                                       direction="outbound",
                                       conversation_id=convo.id)
-        send_message(customer_phone, intro, is_whatsapp)
+        send_message(from_phone_clean, intro, is_whatsapp)
         return Response(status_code=204)
 
     # Handle CONTINUATION classification
@@ -484,15 +538,17 @@ async def sms_webhook(From: str = Form(...),
             print("   No active convo - creating new one")
             # Create new conversation if none exists
             convo = await conv_repo.create_conversation(
-                contractor_id=contractor.id, customer_phone=customer_phone)
+                contractor_id=contractor.id,
+                customer_phone=customer_phone_db  # Store with channel prefix
+            )
             intro = f"Hi! I'm {contractor.name}'s assistant. To get started, please tell me the type of job you need."
 
-            await msg_repo.create_message(sender=To,
-                                          receiver=customer_phone,
+            await msg_repo.create_message(sender=system_phone_db,
+                                          receiver=customer_phone_db,
                                           body=intro,
                                           direction="outbound",
                                           conversation_id=convo.id)
-            send_message(customer_phone, intro, is_whatsapp)
+            send_message(from_phone_clean, intro, is_whatsapp)
             return Response(status_code=204)
         else:
             print(f"   Using existing conversation: {old_convo.id}")
@@ -502,8 +558,8 @@ async def sms_webhook(From: str = Form(...),
     print(f"📋 CONTINUING qualification process...")
 
     # Log the incoming message
-    await msg_repo.create_message(sender=customer_phone,
-                                  receiver=To,
+    await msg_repo.create_message(sender=customer_phone_db,
+                                  receiver=system_phone_db,
                                   body=Body,
                                   direction="inbound",
                                   conversation_id=convo.id)
@@ -517,12 +573,13 @@ async def sms_webhook(From: str = Form(...),
     print(f"   Extracted data: {data}")
 
     # Store/update the qualification data
-    await data_repo.upsert(conversation_id=convo.id,
-                           contractor_id=contractor.id,
-                           customer_phone=customer_phone,
-                           data_dict=data,
-                           qualified=is_qualified(data),
-                           job_title=data.get("job_type"))
+    await data_repo.upsert(
+        conversation_id=convo.id,
+        contractor_id=contractor.id,
+        customer_phone=customer_phone_db,  # Store with channel prefix
+        data_dict=data,
+        qualified=is_qualified(data),
+        job_title=data.get("job_type"))
 
     # Check for missing fields and prompt accordingly
     missing = [k for k in REQUIRED_FIELDS if not data[k]]
@@ -538,12 +595,12 @@ async def sms_webhook(From: str = Form(...),
                    f"Please provide your {labels[0]} and {labels[1]}.")
 
         print(f"   Asking for: {ask}")
-        await msg_repo.create_message(sender=To,
-                                      receiver=customer_phone,
+        await msg_repo.create_message(sender=system_phone_db,
+                                      receiver=customer_phone_db,
                                       body=ask,
                                       direction="outbound",
                                       conversation_id=convo.id)
-        send_message(customer_phone, ask, is_whatsapp)
+        send_message(from_phone_clean, ask, is_whatsapp)
         return Response(status_code=204)
 
     # If all fields are collected and we're in QUALIFYING state, show summary
@@ -556,12 +613,12 @@ async def sms_webhook(From: str = Form(...),
         summary = "Here's what I have so far:\n" + "\n".join(
             bullets) + "\nIs that correct?"
 
-        await msg_repo.create_message(sender=To,
-                                      receiver=customer_phone,
+        await msg_repo.create_message(sender=system_phone_db,
+                                      receiver=customer_phone_db,
                                       body=summary,
                                       direction="outbound",
                                       conversation_id=convo.id)
-        send_message(customer_phone, summary, is_whatsapp)
+        send_message(from_phone_clean, summary, is_whatsapp)
 
         convo.status = "CONFIRMING"
         await session.commit()
@@ -592,6 +649,6 @@ def generate_pdf(convo_id: str):
 # scheduler.start()
 
 print("🚀 SMS Lead Qualification Bot started successfully!")
-print("📱 Supporting both SMS and WhatsApp channels")
+print("📱 Supporting both SMS and WhatsApp channels with COMPLETE separation")
 print("🔧 Debug mode enabled with enhanced logging")
 # print("⏰ Daily digest scheduled for 6 PM")  # Commented out
