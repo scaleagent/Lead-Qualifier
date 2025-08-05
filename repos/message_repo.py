@@ -33,26 +33,31 @@ class MessageRepo:
     async def get_recent_messages(self,
                                   customer: str,
                                   contractor: str,
+                                  conversation_id: str = None,
                                   limit: int = 10):
         """
-        Fetch the last `limit` messages between the two numbers, newest first.
-        (Used only for classification when there's no active conversation.)
-
-        IMPORTANT: Maintains complete separation between SMS and WhatsApp.
-        - WhatsApp numbers stored as: wa:+447742001014
-        - SMS numbers stored as: +447742001014
-        - NO cross-pollination between channels
+        Fetch the last `limit` messages between the two numbers.
+        If conversation_id provided, only fetch from that conversation.
+        Otherwise, fetch from any non-COMPLETE conversation.
         """
-        stmt = (
-            select(Message.direction, Message.body).where(
-                # Fixed: Proper parentheses and EXACT format matching only
-                # No cross-channel contamination - WhatsApp stays WhatsApp, SMS stays SMS
-                ((Message.sender == customer)
-                 & (Message.receiver == contractor))
-                | ((Message.sender == contractor)
-                   & (Message.receiver == customer))).order_by(
-                       Message.timestamp.desc()).limit(limit))
-
+        if conversation_id:
+            # Fetch messages only from the specified conversation
+            stmt = (select(Message.direction, Message.body).where(
+                Message.conversation_id == conversation_id).order_by(
+                    Message.timestamp.desc()).limit(limit))
+        else:
+            # Fetch messages from non-COMPLETE conversations only
+            stmt = (
+                select(Message.direction, Message.body).join(
+                    Conversation,
+                    Message.conversation_id == Conversation.id).where(
+                        ((Message.sender == customer) &
+                         (Message.receiver == contractor))
+                        | ((Message.sender == contractor) &
+                           (Message.receiver == customer)),
+                        Conversation.status !=
+                        "COMPLETE"  # Exclude completed conversations
+                    ).order_by(Message.timestamp.desc()).limit(limit))
         result = await self.session.execute(stmt)
         rows = result.all()
         return list(reversed(rows))

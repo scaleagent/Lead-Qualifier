@@ -509,27 +509,56 @@ async def sms_webhook(From: str = Form(...),
 
             return Response(status_code=204)
 
-    # 4) SIMPLE Classification - like your working version
+    # 4) Save the incoming message FIRST (before classification)
+    # This ensures we never lose messages
+    if old_convo:
+        await msg_repo.create_message(sender=customer_phone_db,
+                                      receiver=system_phone_db,
+                                      body=Body,
+                                      direction="inbound",
+                                      conversation_id=old_convo.id)
+
+    # 5) Message Classification
     print(f"🧠 STARTING message classification...")
 
-    recent_msgs = await msg_repo.get_recent_messages(
-        customer=customer_phone_db,  # Use DB format with channel prefix
-        contractor=system_phone_db,  # Use DB format with channel prefix
-        limit=10)
+    # Special case: If this is right after a "reach out" command, always CONTINUATION
+    # Check if the last message in the conversation was the AI intro
+    if old_convo:
+        last_messages = await msg_repo.get_recent_messages(
+            customer=customer_phone_db,
+            contractor=system_phone_db,
+            conversation_id=old_convo.id,  # Only from this conversation
+            limit=2)
 
-    print(f"🔍 CLASSIFICATION DEBUG:")
-    print(
-        f"   Querying with customer={customer_phone_db}, contractor={system_phone_db}"
-    )
-    print(f"   Found {len(recent_msgs)} recent messages")
-    print(f"   Recent messages raw: {recent_msgs}")
+        # If only 1 message and it's the AI intro, this must be a continuation
+        if len(last_messages) == 1 and last_messages[0][
+                0] == "outbound" and "To get started, please tell me the type of job" in last_messages[
+                    0][1]:
+            print("🔄 First response after reach out - forcing CONTINUATION")
+            classification = "CONTINUATION"
+        else:
+            # Normal classification using only active conversation history
+            recent_msgs = await msg_repo.get_recent_messages(
+                customer=customer_phone_db,
+                contractor=system_phone_db,
+                conversation_id=old_convo.id,  # Only from this conversation
+                limit=10)
 
-    history = "\n".join(f"{'Customer' if d=='inbound' else 'AI'}: {b}"
-                        for d, b in recent_msgs)
-    print(f"   History for classification: {history!r}")
+            print(f"🔍 CLASSIFICATION DEBUG:")
+            print(f"   Querying conversation: {old_convo.id}")
+            print(f"   Found {len(recent_msgs)} recent messages")
+            print(f"   Recent messages raw: {recent_msgs}")
 
-    classification = await classify_message(Body, history)
-    print(f"🧠 CLASSIFICATION RESULT: {classification}")
+            history = "\n".join(f"{'Customer' if d=='inbound' else 'AI'}: {b}"
+                                for d, b in recent_msgs)
+            print(f"   History for classification: {history!r}")
+
+            classification = await classify_message(Body, history)
+            print(f"🧠 CLASSIFICATION RESULT: {classification}")
+    else:
+        # No active conversation - must be NEW
+        print("❌ No active conversation - treating as NEW")
+        classification = "NEW"
 
     # Handle UNSURE classification
     if classification == "UNSURE":
@@ -562,10 +591,15 @@ async def sms_webhook(From: str = Form(...),
             await conv_repo.close_conversation(old_convo.id)
 
         convo = await conv_repo.create_conversation(
-            contractor_id=contractor.id,
-            customer_phone=customer_phone_db  # Store with channel prefix
-        )
+            contractor_id=contractor.id, customer_phone=customer_phone_db)
         print(f"   Created new conversation: {convo.id}")
+
+        # Save the message that triggered the new conversation
+        await msg_repo.create_message(sender=customer_phone_db,
+                                      receiver=system_phone_db,
+                                      body=Body,
+                                      direction="inbound",
+                                      conversation_id=convo.id)
 
         intro = f"Hi! I'm {contractor.name}'s assistant. To get started, please tell me the type of job you need."
 
@@ -584,9 +618,15 @@ async def sms_webhook(From: str = Form(...),
             print("   No active convo - creating new one")
             # Create new conversation if none exists
             convo = await conv_repo.create_conversation(
-                contractor_id=contractor.id,
-                customer_phone=customer_phone_db  # Store with channel prefix
-            )
+                contractor_id=contractor.id, customer_phone=customer_phone_db)
+
+            # Save the message
+            await msg_repo.create_message(sender=customer_phone_db,
+                                          receiver=system_phone_db,
+                                          body=Body,
+                                          direction="inbound",
+                                          conversation_id=convo.id)
+
             intro = f"Hi! I'm {contractor.name}'s assistant. To get started, please tell me the type of job you need."
 
             await msg_repo.create_message(sender=system_phone_db,
@@ -600,21 +640,18 @@ async def sms_webhook(From: str = Form(...),
             print(f"   Using existing conversation: {old_convo.id}")
             convo = old_convo
 
-    # 5) Continue with qualification process - SIMPLE like your working version
+    # 6) Continue with qualification process
     print(f"📋 CONTINUING qualification process...")
 
-    # Log the incoming message
-    await msg_repo.create_message(sender=customer_phone_db,
-                                  receiver=system_phone_db,
-                                  body=Body,
-                                  direction="inbound",
-                                  conversation_id=convo.id)
+    # Note: Message was already saved above, so we don't save it again here
 
     # Extract qualification data from full conversation
     full_msgs = await msg_repo.get_all_conversation_messages(convo.id)
     history = "\n".join(f"{'Customer' if d=='inbound' else 'AI'}: {b}"
                         for d, b in full_msgs)
     data = await extract_qualification_data(history)
+
+    # ... rest of the qualification logic remains the same
 
     print(f"   Extracted data: {data}")
 
