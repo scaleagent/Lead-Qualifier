@@ -30,6 +30,7 @@ class Contractor(Base):
     updated_at = Column(DateTime,
                         default=datetime.utcnow,
                         onupdate=datetime.utcnow)
+    digest_config =Column(JSON, nullable=False, default=dict)
 
     # backref from Conversation:
     conversations = relationship("Conversation", back_populates="contractor")
