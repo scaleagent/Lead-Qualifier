@@ -44,3 +44,15 @@ class ConversationRepo:
             convo.status = "COMPLETE"
             convo.updated_at = datetime.utcnow()
             await self.session.commit()
+
+    # --- New method for fetching ongoing (collecting-notes) leads ---
+    async def get_collecting_notes_for_contractor(
+            self, contractor_id: int) -> list[Conversation]:
+        """
+        Return all conversations for a contractor that are in COLLECTING_NOTES status.
+        """
+        stmt = select(Conversation).where(
+            Conversation.contractor_id == contractor_id,
+            Conversation.status == "COLLECTING_NOTES")
+        result = await self.session.execute(stmt)
+        return result.scalars().all()

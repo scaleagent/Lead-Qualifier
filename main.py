@@ -274,6 +274,15 @@ async def on_startup():
     async with async_engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
+    scheduler = AsyncIOScheduler(timezone="UTC")
+    scheduler.add_job(
+        lambda: asyncio.create_task(run_daily_digest()),
+        'cron',
+        # 6 PM daily
+        minute=0)
+    scheduler.start()
+    logging.info("Scheduled daily digest job every hour on the hour")
+
 
 @app.get("/", response_class=PlainTextResponse)
 def read_root():

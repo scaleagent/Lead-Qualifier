@@ -30,3 +30,13 @@ class ContractorRepo:
         await self.session.commit()
         await self.session.refresh(c)
         return c
+
+    # --- New method for loading digest configuration ---
+    async def get_digest_config(self, contractor_id: int) -> dict:
+        """
+        Load and return the digest_config JSON for the given contractor.
+        """
+        contractor = await self.get_by_id(contractor_id)
+        if contractor and hasattr(contractor, 'digest_config'):
+            return contractor.digest_config or {}
+        return {}
