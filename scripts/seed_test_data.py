@@ -16,7 +16,7 @@ async def seed():
 
         # ——— 1) Create two contractors with different digest settings ———
         c1 = await contractor_repo.create(name="Alice Home",
-                                          phone="+441234567890")
+                                          phone="+441234567899")
         # Update digest_config directly on the model
         c1.digest_config = {
             "digest_hour": 18,
