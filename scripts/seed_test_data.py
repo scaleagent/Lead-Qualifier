@@ -14,31 +14,42 @@ async def seed():
         conv_repo = ConversationRepo(session)
         data_repo = ConversationDataRepo(session)
 
-        # ——— 1) Create two contractors with different digest settings ———
-        c1 = await contractor_repo.create(name="Alice Home",
-                                          phone="+441234567899")
-        # Update digest_config directly on the model
-        c1.digest_config = {
-            "digest_hour": 18,
-            "timezone": "Europe/London",
-            "repeat_until_takeover": True
-        }
-        session.add(c1)
-        await session.commit()
+        # ——— Helper to get-or-create a contractor ———
+        async def get_or_create_contractor(name, phone, config):
+            existing = await contractor_repo.get_by_phone(phone)
+            if existing:
+                print(f"ℹ️ Contractor {phone} already exists, loading")
+                contractor = existing
+            else:
+                contractor = await contractor_repo.create(name=name,
+                                                          phone=phone)
+                print(f"➕ Created contractor {phone}")
+            # Always overwrite digest_config
+            contractor.digest_config = config
+            session.add(contractor)
+            await session.commit()
+            return contractor
 
-        c2 = await contractor_repo.create(name="Bob Builders",
-                                          phone="+441234567891")
-        c2.digest_config = {
-            "digest_hour": 17,
-            "timezone": "Europe/London",
-            "repeat_until_takeover": False
-        }
-        session.add(c2)
-        await session.commit()
+        # 1) Create/get two contractors
+        c1 = await get_or_create_contractor(name="Alice Home",
+                                            phone="+441234567890",
+                                            config={
+                                                "digest_hour": 18,
+                                                "timezone": "Europe/London",
+                                                "repeat_until_takeover": True
+                                            })
+        c2 = await get_or_create_contractor(name="Bob Builders",
+                                            phone="+441234567891",
+                                            config={
+                                                "digest_hour": 17,
+                                                "timezone": "Europe/London",
+                                                "repeat_until_takeover": False
+                                            })
 
-        # ——— 2) Seed leads for Alice (c1) ———
+        # 2) Seed leads for Alice
+        # (same as before, but you can wrap each in get-or-create if needed)
 
-        # 2a) A fresh qualified lead, never sent
+        # 2a) Fresh qualified lead
         convo_a1 = await conv_repo.create_conversation(
             contractor_id=c1.id, customer_phone="+447700900001")
         await data_repo.upsert(conversation_id=convo_a1.id,
@@ -48,7 +59,7 @@ async def seed():
                                qualified=True,
                                job_title="Kitchen Renovation")
 
-        # 2b) An opted-out lead that should not appear
+        # 2b) Opted-out lead
         convo_a2 = await conv_repo.create_conversation(
             contractor_id=c1.id, customer_phone="+447700900002")
         await data_repo.upsert(conversation_id=convo_a2.id,
@@ -59,10 +70,9 @@ async def seed():
                                job_title="Bathroom Remodel")
         await data_repo.mark_digest_opt_out(convo_a2.id)
 
-        # 2c) An ongoing (COLLECTING_NOTES) lead
+        # 2c) Ongoing note-collection lead
         convo_a3 = await conv_repo.create_conversation(
             contractor_id=c1.id, customer_phone="+447700900003")
-        # manually flip status to COLLECTING_NOTES
         convo_a3.status = "COLLECTING_NOTES"
         session.add(convo_a3)
         await session.commit()
@@ -73,9 +83,7 @@ async def seed():
                                qualified=True,
                                job_title="Roof Repair")
 
-        # ——— 3) Seed leads for Bob (c2) ———
-
-        # 3a) A lead that was sent yesterday (to test repeat vs. one-off)
+        # 3) Seed leads for Bob
         convo_b1 = await conv_repo.create_conversation(
             contractor_id=c2.id, customer_phone="+447700900010")
         await data_repo.upsert(conversation_id=convo_b1.id,
