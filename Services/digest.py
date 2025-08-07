@@ -30,6 +30,10 @@ async def run_daily_digest():
         logger.info(f"Found {len(contractors)} contractors for daily digest")
 
         for contractor in contractors:
+
+            #Set destination phone as mine for testing
+            dest_phone = os.getenv("DIGEST_TEST_PHONE") or contractor.phone
+
             # Load digest config
             config = contractor.digest_config or {}
             digest_hour = config.get('digest_hour', 18)
@@ -80,7 +84,9 @@ async def run_daily_digest():
                 text = (f"Closed Lead: {lead.job_title}\n"
                         f"Details: see details in PDF\n"
                         f"PDF Transcript: {pdf_url}")
-                send_message(contractor.phone, text, is_whatsapp=False)
+                #send_message(contractor.phone, text, is_whatsapp=False) # un comment when out of testing
+                send_message(dest_phone, text, is_whatsapp=False)
+
                 await data_repo.mark_digest_sent(lead.conversation_id, now_utc)
                 logger.debug(
                     f"    Sent qualified lead digest for convo {lead.conversation_id}"
@@ -90,7 +96,9 @@ async def run_daily_digest():
             if ongoing_leads:
                 titles = ' • '.join([l.job_title for l in ongoing_leads])
                 text = f"Ongoing Leads: • {titles}"
-                send_message(contractor.phone, text, is_whatsapp=False)
+                #send_message(contractor.phone, text, is_whatsapp=False) # un comment when out of testing
+                send_message(dest_phone, text, is_whatsapp=False)
+
                 logger.debug(
                     f"    Sent ongoing leads digest for contractor {contractor.id}"
                 )

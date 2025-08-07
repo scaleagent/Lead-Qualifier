@@ -13,6 +13,7 @@ from sqlalchemy.future import select
 from openai import OpenAI
 from twilio.rest import Client
 from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # --- Database & Repos imports ---
 from repos.database import async_engine, AsyncSessionLocal
