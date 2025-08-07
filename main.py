@@ -23,6 +23,9 @@ from repos.conversation_repo import ConversationRepo
 from repos.message_repo import MessageRepo
 from repos.conversation_data_repo import ConversationDataRepo
 
+from services.digest import run_daily_digest
+
+
 # Set up clean logging format
 logging.basicConfig(format='%(asctime)s [%(levelname)s] %(message)s',
                     level=logging.INFO)
