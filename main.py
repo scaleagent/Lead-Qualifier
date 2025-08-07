@@ -397,14 +397,20 @@ async def sms_webhook(From: str = Form(...),
         return Response(status_code=204)
 
     # 2) Handle customer-initiated messages
+
     print(f"👤 CUSTOMER MESSAGE from: {customer_phone_db}")
 
-    # Get the first available contractor (single-contractor setup)
-    result = await session.execute(select(Contractor))
-    contractor = result.scalars().first()
+    # Lookup which contractor owns the assistant number (To:)
+    contractor = await contractor_repo.get_by_assistant_phone(system_phone_db)
     if not contractor:
-        print("⚠️ No contractor found; dropping message.")
+        print(
+            f"⚠️ Unrecognized assistant number: {system_phone_db}; dropping message."
+        )
         return Response(status_code=204)
+
+    print(
+        f"🏢 Routing customer message to contractor: {contractor.name} (ID: {contractor.id})"
+    )
 
     print(f"🏢 USING contractor: {contractor.name} (ID: {contractor.id})")
 

@@ -40,3 +40,10 @@ class ContractorRepo:
         if contractor and hasattr(contractor, 'digest_config'):
             return contractor.digest_config or {}
         return {}
+
+    async def get_by_assistant_phone(
+            self, assistant_phone: str) -> Contractor | None:
+        stmt = select(Contractor).where(
+            Contractor.assistant_phone == assistant_phone)
+        result = await self.session.execute(stmt)
+        return result.scalars().first()
