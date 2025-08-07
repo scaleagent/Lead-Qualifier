@@ -25,12 +25,13 @@ class Contractor(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     name = Column(String, nullable=False)
     phone = Column(String, unique=True, nullable=False)
+    assistant_phone = Column(String, unique=True, nullable=False)
     address = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime,
                         default=datetime.utcnow,
                         onupdate=datetime.utcnow)
-    digest_config =Column(JSON, nullable=False, default=dict)
+    digest_config = Column(JSON, nullable=False, default=dict)
 
     # backref from Conversation:
     conversations = relationship("Conversation", back_populates="contractor")
