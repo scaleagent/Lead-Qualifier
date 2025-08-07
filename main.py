@@ -25,7 +25,7 @@ from repos.conversation_data_repo import ConversationDataRepo
 
 from services.digest import run_daily_digest
 
-
+from utils.messaging import send_message
 # Set up clean logging format
 logging.basicConfig(format='%(asctime)s [%(levelname)s] %(message)s',
                     level=logging.INFO)
@@ -75,30 +75,30 @@ def get_system_number_for_db(is_whatsapp: bool) -> str:
 
 
 # === Helpers ===
-def send_message(to_number: str, message: str, is_whatsapp: bool = False):
-    """
-    UNIFIED: Send message via SMS or WhatsApp using same logic.
-    """
-    # Format recipient based on channel
-    if is_whatsapp:
-        tw_to = f"whatsapp:{to_number}"
-        from_number = WA_SANDBOX_NUMBER
-        channel = "WhatsApp"
-    else:
-        tw_to = to_number
-        from_number = TWILIO_NUMBER
-        channel = "SMS"
+# def send_message(to_number: str, message: str, is_whatsapp: bool = False):
+#     """
+#     UNIFIED: Send message via SMS or WhatsApp using same logic.
+#     """
+#     # Format recipient based on channel
+#     if is_whatsapp:
+#         tw_to = f"whatsapp:{to_number}"
+#         from_number = WA_SANDBOX_NUMBER
+#         channel = "WhatsApp"
+#     else:
+#         tw_to = to_number
+#         from_number = TWILIO_NUMBER
+#         channel = "SMS"
 
-    try:
-        msg = twilio_client.messages.create(body=message,
-                                            from_=from_number,
-                                            to=tw_to)
-        print(
-            f"📤 Sent {channel} to {to_number} | SID: {msg.sid} | Status: {msg.status}"
-        )
-    except Exception:
-        print(f"❌ Failed to send {channel} to {to_number}")
-        traceback.print_exc()
+#     try:
+#         msg = twilio_client.messages.create(body=message,
+#                                             from_=from_number,
+#                                             to=tw_to)
+#         print(
+#             f"📤 Sent {channel} to {to_number} | SID: {msg.sid} | Status: {msg.status}"
+#         )
+#     except Exception:
+#         print(f"❌ Failed to send {channel} to {to_number}")
+#         traceback.print_exc()
 
 
 async def classify_message(message_text: str, history_string: str) -> str:

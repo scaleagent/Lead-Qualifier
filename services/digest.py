@@ -11,7 +11,7 @@ from repos.message_repo import MessageRepo
 from repos.models import ConversationData
 
 # Import your send_message helper from main or a utils module
-from main import send_message
+from utils.messaging import send_message
 
 logger = logging.getLogger(__name__)
 
