@@ -1,5 +1,3 @@
-#repos/models.py
-
 import uuid
 from datetime import datetime
 
@@ -15,6 +13,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import relationship
+from sqlalchemy.ext.mutable import MutableDict  # ← added for JSON mutability
 
 Base = declarative_base()
 
@@ -27,11 +26,11 @@ class Contractor(Base):
     phone = Column(String, unique=True, nullable=False)
     assistant_phone = Column(String, unique=True, nullable=False)
     address = Column(String, nullable=True)
+    digest_config = Column(JSON, nullable=False, default=dict)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime,
                         default=datetime.utcnow,
                         onupdate=datetime.utcnow)
-    digest_config = Column(JSON, nullable=False, default=dict)
 
     # backref from Conversation:
     conversations = relationship("Conversation", back_populates="contractor")
@@ -80,9 +79,12 @@ class ConversationData(Base):
                            ForeignKey("contractors.id"),
                            nullable=False)
     customer_phone = Column(String, nullable=False)
-    data_json = Column(JSON, nullable=False)
+    # Use MutableDict so nested JSON changes are tracked by SQLAlchemy
+    data_json = Column(MutableDict.as_mutable(JSON), nullable=False)
     last_updated = Column(DateTime,
                           default=datetime.utcnow,
                           onupdate=datetime.utcnow)
     qualified = Column(Boolean, default=False)
     job_title = Column(String, nullable=True)
+    opt_out_of_digest = Column(Boolean, default=False, nullable=False)
+    last_digest_sent = Column(DateTime, nullable=True)
