@@ -100,3 +100,19 @@ class ConversationDataRepo:
         result = await self.session.execute(
             stmt.params(repeat_flag=repeat_until_takeover))
         return result.scalars().all()
+
+    async def find_by_job_title_fuzzy(
+            self, contractor_id: int,
+            job_title: str) -> ConversationData | None:
+        """
+        Find a conversation by fuzzy matching job title for takeover command.
+        Searches for conversations belonging to this contractor where the job title
+        contains the search term (case-insensitive).
+        """
+        from sqlalchemy.future import select
+
+        stmt = select(ConversationData).where(
+            ConversationData.contractor_id == contractor_id,
+            ConversationData.job_title.ilike(f"%{job_title}%"))
+        result = await self.session.execute(stmt)
+        return result.scalars().first()
