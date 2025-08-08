@@ -1,13 +1,15 @@
+# main.py
+
 import os
 import json
 import traceback
 import asyncio
 import re
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from fastapi import FastAPI, Depends, Form, Response
-from fastapi.responses import PlainTextResponse, FileResponse
+from fastapi.responses import PlainTextResponse, FileResponse, Response
 from sqlalchemy.future import select
 
 from openai import OpenAI
@@ -26,6 +28,12 @@ from repos.conversation_data_repo import ConversationDataRepo
 from services.digest import run_daily_digest
 
 from utils.messaging import send_message
+
+## imports for pdf generation
+import hashlib
+import hmac
+from urllib.parse import quote
+
 # Set up clean logging format
 logging.basicConfig(format='%(asctime)s [%(levelname)s] %(message)s',
                     level=logging.INFO)
@@ -315,6 +323,45 @@ async def list_contractors(session=Depends(get_session)):
     return "\n".join(result)
 
 
+# ===== Takeover Command Handler =====
+# Add this to your SMS webhook handler
+
+
+async def handle_takeover_command(body: str, contractor: Contractor,
+                                  session) -> str | None:
+    """
+    Handle contractor takeover commands like "stop daily digest for plumbing job"
+    Returns response message if command was handled, None otherwise.
+    """
+    # Check for takeover command patterns
+    patterns = [
+        r"stop\s+(?:daily\s+)?digest\s+for\s+(.+)", r"takeover\s+(.+)",
+        r"take\s+over\s+(.+)", r"claim\s+(.+)"
+    ]
+
+    for pattern in patterns:
+        match = re.match(pattern, body.lower().strip())
+        if match:
+            job_query = match.group(1).strip()
+
+            # Find matching conversation
+            data_repo = ConversationDataRepo(session)
+            lead = await data_repo.find_by_job_title_fuzzy(
+                contractor.id, job_query)
+
+            if lead:
+                # Mark as opted out
+                await data_repo.mark_digest_opt_out(lead.conversation_id)
+
+                return (f"✅ Stopped daily digest for '{lead.job_title}'. "
+                        f"You won't receive further updates about this lead.")
+            else:
+                return (f"❌ Couldn't find a lead matching '{job_query}'. "
+                        f"Please check the job title and try again.")
+
+    return None  # Not a takeover command
+
+
 @app.post("/sms", response_class=PlainTextResponse)
 async def sms_webhook(From: str = Form(...),
                       To: str = Form(...),
@@ -353,6 +400,34 @@ async def sms_webhook(From: str = Form(...),
         print(
             f"✅ CONTRACTOR IDENTIFIED: {contractor.name} (ID: {contractor.id})"
         )
+
+        # ===== CHECK FOR TAKEOVER COMMAND FIRST =====
+        takeover_response = await handle_takeover_command(
+            Body, contractor, session)
+        if takeover_response:
+            print(f"🎯 TAKEOVER COMMAND processed")
+
+            # Log the command
+            await msg_repo.create_message(
+                sender=customer_phone_db,
+                receiver=system_phone_db,
+                body=Body,
+                direction="inbound",
+                conversation_id=None  # Command, not part of a conversation
+            )
+
+            # Send response
+            send_message(from_phone_clean, takeover_response, is_whatsapp)
+
+            # Log the response
+            await msg_repo.create_message(sender=system_phone_db,
+                                          receiver=customer_phone_db,
+                                          body=takeover_response,
+                                          direction="outbound",
+                                          conversation_id=None)
+
+            return Response(status_code=204)
+        # ===== CHECK FOR "REACH OUT TO" COMMAND =====
         # Match both UK and international phone numbers
         m = re.match(r'^\s*reach out to (\+\d{10,15})\s*$', Body,
                      re.IGNORECASE)
@@ -724,6 +799,20 @@ async def sms_webhook(From: str = Form(...),
     return Response(status_code=204)
 
 
+# In your SMS webhook, add this check for contractor messages:
+"""
+# After identifying contractor...
+if contractor:
+    # Check for takeover command
+    takeover_response = await handle_takeover_command(Body, contractor, session)
+    if takeover_response:
+        send_message(from_phone_clean, takeover_response, is_whatsapp)
+        return Response(status_code=204)
+
+    # Continue with existing "reach out to" logic...
+"""
+
+
 @app.get("/pdf/{convo_id}")
 def generate_pdf(convo_id: str):
     """Generate PDF report for a conversation."""
@@ -750,3 +839,182 @@ print("🚀 SMS Lead Qualification Bot started successfully!")
 print("📱 Supporting both SMS and WhatsApp channels with COMPLETE separation")
 print("🔧 Debug mode enabled with enhanced logging")
 # print("⏰ Daily digest scheduled for 6 PM")  # Commented out
+
+# ===== PDF Security Functions =====
+
+PDF_SECRET_KEY = os.environ.get("PDF_SECRET_KEY", "change-this-in-production")
+
+
+def generate_pdf_token(conversation_id: str,
+                       expires_in_hours: int = 24) -> str:
+    """
+    Generate a time-limited signed token for secure PDF access.
+    Token format: conversation_id:expiry_timestamp:signature
+    """
+    expiry = int(
+        (datetime.utcnow() + timedelta(hours=expires_in_hours)).timestamp())
+    message = f"{conversation_id}:{expiry}"
+    signature = hmac.new(PDF_SECRET_KEY.encode(), message.encode(),
+                         hashlib.sha256).hexdigest()
+    return f"{message}:{signature}"
+
+
+def verify_pdf_token(token: str) -> tuple[bool, str]:
+    """
+    Verify PDF access token and extract conversation_id.
+    Returns: (is_valid, conversation_id)
+    """
+    try:
+        parts = token.split(':')
+        if len(parts) != 3:
+            logging.warning(f"Invalid token format: {token}")
+            return False, ""
+
+        conversation_id, expiry_str, provided_signature = parts
+        expiry = int(expiry_str)
+
+        # Check if token has expired
+        if datetime.utcnow().timestamp() > expiry:
+            logging.info(
+                f"Token expired for conversation {conversation_id[:8]}...")
+            return False, ""
+
+        # Verify signature to prevent tampering
+        message = f"{conversation_id}:{expiry_str}"
+        expected_signature = hmac.new(PDF_SECRET_KEY.encode(),
+                                      message.encode(),
+                                      hashlib.sha256).hexdigest()
+
+        # Use constant-time comparison to prevent timing attacks
+        if hmac.compare_digest(expected_signature, provided_signature):
+            return True, conversation_id
+
+        logging.warning(
+            f"Invalid signature for conversation {conversation_id[:8]}...")
+        return False, ""
+
+    except Exception as e:
+        logging.error(f"Token verification error: {e}")
+        return False, ""
+
+
+def generate_pdf_url(conversation_id: str, base_url: str = None) -> str:
+    """
+    Generate a complete URL for PDF access with signed token.
+    Used in digest messages to provide secure PDF links.
+    """
+    if not base_url:
+        base_url = os.environ.get("APP_BASE_URL",
+                                  "https://your-app.herokuapp.com")
+
+    token = generate_pdf_token(conversation_id)
+    # URL-encode the token to handle special characters
+    return f"{base_url}/pdf/transcript?token={quote(token)}"
+
+
+# ===== PDF Endpoints =====
+
+
+@app.get("/pdf/transcript")
+async def get_transcript_pdf(token: str, session=Depends(get_session)):
+    """
+    Secure endpoint for PDF transcript generation.
+    Generates PDF on-demand to ensure most current data.
+
+    Usage: /pdf/transcript?token=SIGNED_TOKEN
+
+    The token contains:
+    - conversation_id
+    - expiry timestamp
+    - HMAC signature for security
+    """
+    from services.pdf_service import generate_conversation_pdf
+
+    # Verify the token
+    is_valid, conversation_id = verify_pdf_token(token)
+
+    if not is_valid:
+        logging.warning(
+            f"Invalid PDF access attempt with token: {token[:20]}...")
+        return PlainTextResponse(
+            "This link has expired or is invalid. Please request a new digest from your contractor.",
+            status_code=403)
+
+    try:
+        # Log successful access
+        logging.info(
+            f"Generating PDF for conversation {conversation_id[:8]}...")
+
+        # Generate the PDF with current data
+        pdf_bytes = await generate_conversation_pdf(session, conversation_id)
+
+        # Return PDF as streaming response
+        return Response(
+            content=pdf_bytes,
+            media_type="application/pdf",
+            headers={
+                # inline = display in browser, attachment = force download
+                "Content-Disposition":
+                f"inline; filename=lead_transcript_{conversation_id[:8]}.pdf",
+                # Cache for 5 minutes to avoid regenerating on refresh
+                "Cache-Control": "private, max-age=300",
+                # Security headers
+                "X-Content-Type-Options": "nosniff",
+                "X-Frame-Options": "DENY"
+            })
+
+    except ValueError as e:
+        # Conversation not found
+        logging.error(f"Conversation not found: {conversation_id}")
+        return PlainTextResponse(
+            "This conversation could not be found. It may have been deleted.",
+            status_code=404)
+
+    except Exception as e:
+        # Unexpected error
+        logging.error(f"PDF generation failed for {conversation_id}: {e}",
+                      exc_info=True)
+        return PlainTextResponse(
+            "An error occurred generating the PDF. Please try again later.",
+            status_code=500)
+
+
+@app.get("/pdf/test/{convo_id}")
+async def test_pdf_generation(convo_id: str, session=Depends(get_session)):
+    """
+    TEST ENDPOINT: Generate PDF directly without token (for development only).
+    Remove this endpoint in production!
+    """
+    if os.environ.get("ENVIRONMENT") == "production":
+        return PlainTextResponse("Not available in production",
+                                 status_code=404)
+
+    from services.pdf_service import generate_conversation_pdf
+
+    try:
+        pdf_bytes = await generate_conversation_pdf(session, convo_id)
+        return Response(content=pdf_bytes,
+                        media_type="application/pdf",
+                        headers={
+                            "Content-Disposition":
+                            f"inline; filename=test_{convo_id[:8]}.pdf"
+                        })
+    except Exception as e:
+        return PlainTextResponse(f"Error: {str(e)}", status_code=500)
+
+
+@app.post("/generate-pdf-link")
+async def generate_pdf_link_endpoint(conversation_id: str = Form(...)):
+    """
+    Admin endpoint to generate a PDF link for a specific conversation.
+    Useful for testing or manual link generation.
+    """
+    # Add authentication here if needed
+
+    url = generate_pdf_url(conversation_id)
+    return {
+        "conversation_id": conversation_id,
+        "pdf_url": url,
+        "expires_in": "24 hours",
+        "generated_at": datetime.utcnow().isoformat()
+    }

@@ -1,3 +1,5 @@
+#services/digest.py
+
 import os
 import asyncio
 import logging
@@ -109,3 +111,83 @@ async def run_daily_digest():
 
 if __name__ == '__main__':
     asyncio.run(run_daily_digest())
+
+
+def generate_pdf_url(conversation_id: str) -> str:
+    """Generate PDF URL with signed token for security"""
+    PDF_SECRET_KEY = os.environ.get("PDF_SECRET_KEY",
+                                    "change-this-in-production")
+    base_url = os.environ.get("APP_BASE_URL", "https://your-app.herokuapp.com")
+
+    # Generate time-limited token
+    expiry = int((datetime.utcnow() + timedelta(hours=24)).timestamp())
+    message = f"{conversation_id}:{expiry}"
+    signature = hmac.new(PDF_SECRET_KEY.encode(), message.encode(),
+                         hashlib.sha256).hexdigest()
+    token = f"{message}:{signature}"
+
+    return f"{base_url}/pdf/transcript?token={token}"
+
+
+def format_qualified_lead_sms(lead: ConversationData) -> str:
+    """Format a qualified lead for SMS with all key details"""
+    data = lead.data_json
+
+    # Extract and truncate fields to fit SMS limits
+    job_type = (data.get('job_type', 'Unknown job') or 'Unknown job')[:30]
+    address = (data.get('address', 'No address') or 'No address')[:40]
+    urgency = (data.get('urgency', 'Not specified') or 'Not specified')[:20]
+    access = (data.get('access', '') or '')[:30]
+
+    # Generate PDF URL
+    pdf_url = generate_pdf_url(lead.conversation_id)
+
+    # Build SMS message
+    parts = [f"🏗 {lead.job_title or job_type}", f"📍 {address}", f"⏰ {urgency}"]
+
+    if access:
+        parts.append(f"🔑 {access}")
+
+    parts.append(f"📄 {pdf_url}")
+
+    text = "\n".join(parts)
+
+    # Ensure SMS doesn't exceed length limits (keep under 300 chars for safety)
+    if len(text) > 300:
+        # Trim the address and access fields first
+        address = address[:20] + "..."
+        if access:
+            access = access[:15] + "..."
+
+        # Rebuild
+        parts = [
+            f"🏗 {lead.job_title or job_type}", f"📍 {address}", f"⏰ {urgency}"
+        ]
+        if access:
+            parts.append(f"🔑 {access}")
+        parts.append(f"📄 {pdf_url}")
+
+        text = "\n".join(parts)
+
+    return text
+
+
+def format_ongoing_leads_sms(ongoing_leads: list[ConversationData]) -> str:
+    """Format ongoing leads into a compact SMS"""
+    if len(ongoing_leads) <= 3:
+        # List individual titles if 3 or fewer
+        titles = []
+        for lead in ongoing_leads:
+            title = (lead.job_title or "Untitled")[:25]
+            titles.append(title)
+
+        text = f"🔄 Ongoing: {' • '.join(titles)}"
+    else:
+        # Just show count if more than 3
+        text = f"🔄 {len(ongoing_leads)} ongoing leads in progress"
+
+    # Keep it short
+    if len(text) > 160:
+        text = f"🔄 {len(ongoing_leads)} ongoing leads"
+
+    return text

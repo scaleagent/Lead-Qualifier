@@ -1,7 +1,10 @@
+#repos/conversation_data_repo.py
+
 from datetime import datetime
 from sqlalchemy.future import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from .models import ConversationData
+import sqlalchemy as sa
 
 
 class ConversationDataRepo:

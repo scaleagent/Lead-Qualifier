@@ -11,4 +11,4 @@ alembic
 python-dotenv
 psycopg2-binary>=2.9.6
 python-multipart
-
+reportlab==4.0.7
