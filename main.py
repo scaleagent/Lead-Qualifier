@@ -400,6 +400,12 @@ async def sms_webhook(From: str = Form(...),
         print(
             f"✅ CONTRACTOR IDENTIFIED: {contractor.name} (ID: {contractor.id})"
         )
+        # ===== DETERMINE WHERE TO SEND RESPONSES =====
+        # Use test phone if configured, otherwise send back to contractor
+        response_phone = os.getenv("DIGEST_TEST_PHONE") or from_phone_clean
+
+        if os.getenv("DIGEST_TEST_PHONE"):
+            print(f"📱 Using TEST PHONE for response: {response_phone}")
 
         # ===== CHECK FOR TAKEOVER COMMAND FIRST =====
         takeover_response = await handle_takeover_command(
