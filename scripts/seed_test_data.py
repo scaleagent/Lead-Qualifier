@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# scripts/seed_test_data.py
 import asyncio
 from datetime import datetime, timedelta
 

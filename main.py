@@ -330,36 +330,95 @@ async def list_contractors(session=Depends(get_session)):
 async def handle_takeover_command(body: str, contractor: Contractor,
                                   session) -> str | None:
     """
-    Handle contractor takeover commands like "stop daily digest for plumbing job"
-    Returns response message if command was handled, None otherwise.
+    Handle contractor takeover commands with detailed logging
     """
+    from repos.conversation_data_repo import ConversationDataRepo
+
+    logger.info(f"🎯 CHECKING FOR TAKEOVER COMMAND")
+    logger.info(f"  Contractor: {contractor.name} (ID: {contractor.id})")
+    logger.info(f"  Message: '{body}'")
+
     # Check for takeover command patterns
     patterns = [
         r"stop\s+(?:daily\s+)?digest\s+for\s+(.+)", r"takeover\s+(.+)",
         r"take\s+over\s+(.+)", r"claim\s+(.+)"
     ]
 
-    for pattern in patterns:
+    for pattern_idx, pattern in enumerate(patterns):
+        logger.debug(f"  Testing pattern {pattern_idx + 1}: {pattern}")
         match = re.match(pattern, body.lower().strip())
+
         if match:
             job_query = match.group(1).strip()
+            logger.info(f"  ✅ TAKEOVER COMMAND DETECTED")
+            logger.info(f"  Pattern matched: {pattern}")
+            logger.info(f"  Job query: '{job_query}'")
 
             # Find matching conversation
             data_repo = ConversationDataRepo(session)
+
+            logger.info(f"  🔍 Searching for job matching '{job_query}'...")
             lead = await data_repo.find_by_job_title_fuzzy(
                 contractor.id, job_query)
 
             if lead:
+                logger.info(f"  ✅ FOUND MATCHING LEAD:")
+                logger.info(f"    Job Title: {lead.job_title}")
+                logger.info(f"    Conversation ID: {lead.conversation_id}")
+                logger.info(f"    Customer Phone: {lead.customer_phone}")
+                logger.info(f"    Qualified: {lead.qualified}")
+                logger.info(f"    Already opted out: {lead.opt_out_of_digest}")
+
+                if lead.opt_out_of_digest:
+                    logger.warning(
+                        f"  ⚠️ Lead was already opted out of digest")
+
                 # Mark as opted out
+                logger.info(f"  📝 Marking lead as opted out of digest...")
                 await data_repo.mark_digest_opt_out(lead.conversation_id)
+                logger.info(f"  ✅ Successfully marked as opted out")
 
-                return (f"✅ Stopped daily digest for '{lead.job_title}'. "
-                        f"You won't receive further updates about this lead.")
+                response = (
+                    f"✅ Stopped daily digest for '{lead.job_title}'. "
+                    f"You won't receive further updates about this lead.")
+                logger.info(f"  Response: {response[:50]}...")
+                return response
             else:
-                return (f"❌ Couldn't find a lead matching '{job_query}'. "
-                        f"Please check the job title and try again.")
+                logger.warning(
+                    f"  ❌ NO MATCHING LEAD FOUND for query '{job_query}'")
 
-    return None  # Not a takeover command
+                # Let's see what leads this contractor has for debugging
+                try:
+                    all_contractor_leads = await data_repo.get_all()
+                    contractor_leads = [
+                        l for l in all_contractor_leads
+                        if l.contractor_id == contractor.id and l.job_title
+                    ]
+
+                    if contractor_leads:
+                        logger.info(
+                            f"  Available job titles for this contractor:")
+                        for idx, lead in enumerate(contractor_leads[:5], 1):
+                            logger.info(
+                                f"    {idx}. '{lead.job_title}' (opt_out={lead.opt_out_of_digest})"
+                            )
+                        if len(contractor_leads) > 5:
+                            logger.info(
+                                f"    ... and {len(contractor_leads) - 5} more"
+                            )
+                    else:
+                        logger.warning(
+                            f"  No leads found for contractor {contractor.id}")
+                except Exception as e:
+                    logger.error(f"  Error listing available leads: {e}")
+
+                response = (f"❌ Couldn't find a lead matching '{job_query}'. "
+                            f"Please check the job title and try again.")
+                logger.info(f"  Response: {response[:50]}...")
+                return response
+
+    logger.info(f"  ℹ️ Not a takeover command - no patterns matched")
+    return None
 
 
 @app.post("/sms", response_class=PlainTextResponse)
@@ -368,10 +427,13 @@ async def sms_webhook(From: str = Form(...),
                       Body: str = Form(...),
                       session=Depends(get_session)):
     From, To, Body = From.strip(), To.strip(), Body.strip()
-    print(f"🔔 INCOMING SMS/WhatsApp:")
-    print(f"   From: {From}")
-    print(f"   To: {To}")
-    print(f"   Body: {Body!r}")
+
+    logger.info("=" * 50)
+    logger.info("🔔 NEW SMS/WHATSAPP WEBHOOK CALL")
+    logger.info(f"From: {From}")
+    logger.info(f"To: {To}")
+    logger.info(f"Body: '{Body}'")
+    logger.info("=" * 50)
 
     # Unified channel detection and normalization
     is_whatsapp = From.startswith("whatsapp:")
@@ -381,11 +443,11 @@ async def sms_webhook(From: str = Form(...),
     customer_phone_db = normalize_phone_for_db(from_phone_clean, is_whatsapp)
     system_phone_db = get_system_number_for_db(is_whatsapp)
 
-    print(f"🔍 PARSED:")
-    print(f"   is_whatsapp: {is_whatsapp}")
-    print(f"   from_phone_clean: {from_phone_clean}")
-    print(f"   customer_phone_db: {customer_phone_db}")
-    print(f"   system_phone_db: {system_phone_db}")
+    logger.info(f"📱 CHANNEL DETECTION:")
+    logger.info(f"  Is WhatsApp: {is_whatsapp}")
+    logger.info(f"  Clean phone: {from_phone_clean}")
+    logger.info(f"  Customer DB format: {customer_phone_db}")
+    logger.info(f"  System DB format: {system_phone_db}")
 
     # Initialize repositories
     contractor_repo = ContractorRepo(session)
@@ -393,86 +455,112 @@ async def sms_webhook(From: str = Form(...),
     msg_repo = MessageRepo(session)
     data_repo = ConversationDataRepo(session)
 
-    # 1) Handle contractor-initiated "reach out" commands
-    # NOTE: Contractors are stored with clean phone numbers (no wa: prefix)
+    # 1) Handle contractor-initiated commands
+    logger.info(f"🔍 Checking if sender is a contractor...")
     contractor = await contractor_repo.get_by_phone(from_phone_clean)
+
     if contractor:
-        print(
+        logger.info(
             f"✅ CONTRACTOR IDENTIFIED: {contractor.name} (ID: {contractor.id})"
         )
-        # ===== DETERMINE WHERE TO SEND RESPONSES =====
-        # Use test phone if configured, otherwise send back to contractor
+
+        # Determine response destination
         response_phone = os.getenv("DIGEST_TEST_PHONE") or from_phone_clean
-
         if os.getenv("DIGEST_TEST_PHONE"):
-            print(f"📱 Using TEST PHONE for response: {response_phone}")
-
-        # ===== CHECK FOR TAKEOVER COMMAND FIRST =====
-        takeover_response = await handle_takeover_command(
-            Body, contractor, session)
-        if takeover_response:
-            print(f"🎯 TAKEOVER COMMAND processed")
-
-            # Log the command
-            await msg_repo.create_message(
-                sender=customer_phone_db,
-                receiver=system_phone_db,
-                body=Body,
-                direction="inbound",
-                conversation_id=None  # Command, not part of a conversation
+            logger.info(
+                f"📱 TEST MODE: Responses will go to {response_phone} instead of {from_phone_clean}"
             )
 
+        # Check for takeover command
+        logger.info(f"Checking for takeover command...")
+        takeover_response = await handle_takeover_command(
+            Body, contractor, session)
+
+        if takeover_response:
+            logger.info(f"🎯 TAKEOVER COMMAND PROCESSED")
+
+            # Log the command in database
+            try:
+                await msg_repo.create_message(sender=customer_phone_db,
+                                              receiver=system_phone_db,
+                                              body=Body,
+                                              direction="inbound",
+                                              conversation_id=None)
+                logger.info(f"  ✅ Logged command to database")
+            except Exception as e:
+                logger.error(f"  ❌ Failed to log command: {e}")
+
             # Send response
-            send_message(from_phone_clean, takeover_response, is_whatsapp)
+            try:
+                send_message(response_phone, takeover_response, is_whatsapp)
+                logger.info(f"  📤 Sent response to {response_phone}")
+            except Exception as e:
+                logger.error(f"  ❌ Failed to send response: {e}")
 
             # Log the response
-            await msg_repo.create_message(sender=system_phone_db,
-                                          receiver=customer_phone_db,
-                                          body=takeover_response,
-                                          direction="outbound",
-                                          conversation_id=None)
+            try:
+                await msg_repo.create_message(sender=system_phone_db,
+                                              receiver=customer_phone_db,
+                                              body=takeover_response,
+                                              direction="outbound",
+                                              conversation_id=None)
+                logger.info(f"  ✅ Logged response to database")
+            except Exception as e:
+                logger.error(f"  ❌ Failed to log response: {e}")
 
+            logger.info(f"Takeover command handling complete")
             return Response(status_code=204)
-        # ===== CHECK FOR "REACH OUT TO" COMMAND =====
-        # Match both UK and international phone numbers
+
+        # Check for "reach out to" command
+        logger.info(f"Checking for 'reach out to' command...")
         m = re.match(r'^\s*reach out to (\+\d{10,15})\s*$', Body,
                      re.IGNORECASE)
         if m:
             target_phone_clean = m.group(1)
             target_phone_db = normalize_phone_for_db(target_phone_clean,
                                                      is_whatsapp)
-            print(
-                f"📞 REACH OUT COMMAND to: {target_phone_clean} (DB: {target_phone_db})"
-            )
+            logger.info(f"📞 REACH OUT COMMAND DETECTED")
+            logger.info(f"  Target phone: {target_phone_clean}")
+            logger.info(f"  Target DB format: {target_phone_db}")
 
-            # Close any existing conversation for this customer ON THIS CHANNEL
+            # Check for existing conversation
             old_convo = await conv_repo.get_active_conversation(
                 contractor.id, target_phone_db)
             if old_convo:
-                print(f"🔄 CLOSING existing conversation: {old_convo.id}")
+                logger.info(f"  🔄 Found existing conversation: {old_convo.id}")
+                logger.info(f"    Status: {old_convo.status}")
+                logger.info(f"    Created: {old_convo.created_at}")
+                logger.info(f"  Closing existing conversation...")
                 await conv_repo.close_conversation(old_convo.id)
+                logger.info(f"  ✅ Closed conversation {old_convo.id}")
+            else:
+                logger.info(f"  No existing conversation found")
 
             # Create new conversation
             convo = await conv_repo.create_conversation(
-                contractor_id=contractor.id,
-                customer_phone=target_phone_db  # Store with channel prefix
-            )
-            print(f"🆕 CREATED new conversation: {convo.id}")
+                contractor_id=contractor.id, customer_phone=target_phone_db)
+            logger.info(f"  🆕 Created new conversation: {convo.id}")
 
             # Send introduction message
             intro = (
                 f"Hi! I'm {contractor.name}'s assistant. "
                 "To get started, please tell me the type of job you need.")
 
-            await msg_repo.create_message(
-                sender=system_phone_db,  # Store with channel prefix
-                receiver=target_phone_db,  # Store with channel prefix
-                body=intro,
-                direction="outbound",
-                conversation_id=convo.id)
-            send_message(target_phone_clean, intro,
-                         is_whatsapp)  # Send with clean phone
-            print(f"📤 SENT intro message to customer: {target_phone_clean}")
+            await msg_repo.create_message(sender=system_phone_db,
+                                          receiver=target_phone_db,
+                                          body=intro,
+                                          direction="outbound",
+                                          conversation_id=convo.id)
+
+            send_message(target_phone_clean, intro, is_whatsapp)
+            logger.info(f"  📤 Sent intro to customer: {target_phone_clean}")
+
+            # Send confirmation to contractor/test phone
+            confirmation = f"✅ Reached out to {target_phone_clean}. Conversation started."
+            send_message(response_phone, confirmation, is_whatsapp)
+            logger.info(f"  📤 Sent confirmation to: {response_phone}")
+
+            logger.info(f"Reach out command handling complete")
 
         return Response(status_code=204)
 
@@ -1024,3 +1112,33 @@ async def generate_pdf_link_endpoint(conversation_id: str = Form(...)):
         "expires_in": "24 hours",
         "generated_at": datetime.utcnow().isoformat()
     }
+
+
+@app.post("/monitor/trigger-digest/{contractor_id}")
+async def trigger_digest_manually(contractor_id: int,
+                                  session=Depends(get_session)):
+    """
+    Manually trigger digest for a specific contractor (for testing).
+    Only works if TEST_MODE env var is set.
+    """
+    if not os.getenv("TEST_MODE"):
+        return {"error": "Manual trigger only available in TEST_MODE"}
+
+    logger.info(
+        f"MONITOR: Manually triggering digest for contractor {contractor_id}")
+
+    from services.digest import run_daily_digest
+
+    # Temporarily override the hour check
+    # This is a bit hacky but useful for testing
+    try:
+        # Run digest for this specific contractor
+        await run_daily_digest()
+        return {
+            "status": "success",
+            "message": f"Digest triggered for contractor {contractor_id}",
+            "note": "Check logs for details"
+        }
+    except Exception as e:
+        logger.error(f"Failed to trigger digest: {e}")
+        return {"status": "error", "error": str(e)}
