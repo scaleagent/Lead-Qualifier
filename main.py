@@ -1132,23 +1132,22 @@ async def trigger_digest_manually(contractor_id: int,
     """
     Manually trigger digest for a specific contractor (for testing).
     Only works if TEST_MODE env var is set.
+    Force-sends the digest for this contractor, ignoring the hour check.
     """
     if not os.getenv("TEST_MODE"):
         return {"error": "Manual trigger only available in TEST_MODE"}
 
     logger.info(
-        f"MONITOR: Manually triggering digest for contractor {contractor_id}")
+        f"MONITOR: Manually triggering digest for contractor {contractor_id} (force override)"
+    )
 
-    from services.digest import run_daily_digest
-
-    # Temporarily override the hour check
-    # This is a bit hacky but useful for testing
     try:
-        # Run digest for this specific contractor
-        await run_daily_digest()
+        # Force = True, and target only this contractor
+        await run_daily_digest(force=True, only_contractor_id=contractor_id)
         return {
             "status": "success",
-            "message": f"Digest triggered for contractor {contractor_id}",
+            "message":
+            f"Forced digest sent (or attempted) for contractor {contractor_id}",
             "note": "Check logs for details"
         }
     except Exception as e:

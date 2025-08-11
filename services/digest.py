@@ -119,13 +119,18 @@ def format_ongoing_leads_sms(ongoing_leads: list[ConversationData]) -> str:
     return text
 
 
-async def run_daily_digest():
+async def run_daily_digest(force: bool = False,
+                           only_contractor_id: int | None = None):
     """
-    Generate and send daily digest of leads to each contractor at their configured hour.
+    Generate and send daily digest of leads to each contractor.
+    If force=True, skip the hour check.
+    If only_contractor_id is set, process only that contractor.
     """
     logger.info("=" * 60)
     logger.info("STARTING DAILY DIGEST RUN")
     logger.info(f"Current UTC time: {datetime.utcnow()}")
+    logger.info(
+        f"Overrides -> force={force}, only_contractor_id={only_contractor_id}")
     logger.info("=" * 60)
 
     try:
@@ -135,9 +140,18 @@ async def run_daily_digest():
             conv_repo = ConversationRepo(session)
             msg_repo = MessageRepo(session)
 
-            contractors = await contractor_repo.get_all()
-            logger.info(
-                f"Found {len(contractors)} total contractors in database")
+            # Load only one contractor if requested
+            if only_contractor_id is not None:
+                one = await contractor_repo.get_by_id(only_contractor_id)
+                contractors = [one] if one else []
+                if not contractors:
+                    logger.warning(
+                        f"No contractor found with id={only_contractor_id}. Nothing to do."
+                    )
+            else:
+                contractors = await contractor_repo.get_all()
+
+            logger.info(f"Found {len(contractors)} contractor(s) to process")
 
             # Track statistics
             stats = {
@@ -153,7 +167,7 @@ async def run_daily_digest():
                     f"\n--- Processing contractor: {contractor.name} (ID: {contractor.id}) ---"
                 )
 
-                # Determine destination phone
+                # Destination phone (test override respected)
                 dest_phone = os.getenv("DIGEST_TEST_PHONE") or contractor.phone
                 if os.getenv("DIGEST_TEST_PHONE"):
                     logger.info(
@@ -163,7 +177,7 @@ async def run_daily_digest():
                     logger.info(
                         f"📱 Using contractor's actual phone: {dest_phone}")
 
-                # Load and log digest config
+                # Digest config
                 config = contractor.digest_config or {}
                 digest_hour = config.get('digest_hour', 18)
                 tz_name = config.get('timezone', 'Europe/London')
@@ -173,7 +187,7 @@ async def run_daily_digest():
                     f"  Config: Hour={digest_hour}, Timezone={tz_name}, Repeat={repeat_flag}"
                 )
 
-                # Check timezone and hour
+                # Local time for the contractor
                 try:
                     now_tz = datetime.now(ZoneInfo(tz_name))
                     logger.info(
@@ -184,15 +198,20 @@ async def run_daily_digest():
                     logger.warning(f"  Falling back to UTC")
                     now_tz = datetime.utcnow()
 
-                # Check if it's the right hour
-                if now_tz.hour != digest_hour:
+                # Hour gating (bypass if force=True)
+                if not force:
+                    if now_tz.hour != digest_hour:
+                        logger.info(
+                            f"  ⏰ SKIPPING: Current hour {now_tz.hour} != configured hour {digest_hour}"
+                        )
+                        stats['contractors_skipped'] += 1
+                        continue
+                    else:
+                        logger.info(f"  ✅ Hour matches! Processing digest...")
+                else:
                     logger.info(
-                        f"  ⏰ SKIPPING: Current hour {now_tz.hour} != configured hour {digest_hour}"
-                    )
-                    stats['contractors_skipped'] += 1
-                    continue
+                        "  ⚡ FORCE OVERRIDE ENABLED: bypassing hour check")
 
-                logger.info(f"  ✅ Hour matches! Processing digest...")
                 stats['contractors_processed'] += 1
 
                 # Fetch qualified leads
@@ -201,7 +220,6 @@ async def run_daily_digest():
                         contractor.id, repeat_flag)
                     logger.info(
                         f"  📋 Found {len(qualified_leads)} qualified leads")
-
                     if qualified_leads:
                         for i, lead in enumerate(qualified_leads, 1):
                             logger.debug(
@@ -211,7 +229,7 @@ async def run_daily_digest():
                     logger.error(f"  ❌ Error fetching qualified leads: {e}")
                     qualified_leads = []
 
-                # Fetch ongoing leads
+                # Fetch ongoing (collecting notes) leads
                 try:
                     collecting_convos = await conv_repo.get_collecting_notes_for_contractor(
                         contractor.id)
@@ -237,7 +255,7 @@ async def run_daily_digest():
                     logger.error(f"  ❌ Error fetching ongoing leads: {e}")
                     ongoing_leads = []
 
-                # Check if there's anything to send
+                # Nothing to send?
                 if not qualified_leads and not ongoing_leads:
                     logger.info(
                         f"  📭 No leads to send for contractor {contractor.id}")
@@ -255,7 +273,6 @@ async def run_daily_digest():
                         logger.debug(
                             f"    SMS content ({len(text)} chars): {text[:100]}..."
                         )
-
                         send_message(dest_phone, text, is_whatsapp=False)
 
                         # Mark as sent
@@ -265,34 +282,31 @@ async def run_daily_digest():
                             f"    ✅ Sent and marked digest for conversation {lead.conversation_id[:8]}..."
                         )
                         stats['qualified_leads_sent'] += 1
-
                     except Exception as e:
                         logger.error(
                             f"    ❌ Failed to send lead {lead.conversation_id[:8]}: {e}"
                         )
                         stats['errors'] += 1
 
-                # Send ongoing leads summary
+                # Send ongoing summary
                 if ongoing_leads:
                     try:
                         text = format_ongoing_leads_sms(ongoing_leads)
                         logger.info(f"  📤 Sending ongoing leads summary...")
                         logger.debug(
                             f"    SMS content ({len(text)} chars): {text}")
-
                         send_message(dest_phone, text, is_whatsapp=False)
                         logger.info(f"    ✅ Sent ongoing leads summary")
                         stats['ongoing_leads_sent'] += 1
-
                     except Exception as e:
                         logger.error(
                             f"    ❌ Failed to send ongoing leads: {e}")
                         stats['errors'] += 1
 
-            # Log final statistics
+            # Final stats
             logger.info("\n" + "=" * 60)
             logger.info("DAILY DIGEST RUN COMPLETED")
-            logger.info(f"Statistics:")
+            logger.info("Statistics:")
             logger.info(
                 f"  Contractors processed: {stats['contractors_processed']}")
             logger.info(
