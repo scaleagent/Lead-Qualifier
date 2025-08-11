@@ -175,7 +175,7 @@ ANALYSIS CHECKLIST:
 Based on the analysis, classify as: NEW, CONTINUATION, or UNSURE"""
 
     resp = openai.chat.completions.create(
-        model="gpt-3.5-turbo",
+        model="gpt-4o-mini",
         messages=[{
             "role": "system",
             "content": system_prompt
@@ -211,7 +211,7 @@ async def extract_qualification_data(history_string: str) -> dict:
         "Respond ONLY with a JSON object with exactly these six keys.")
 
     resp = openai.chat.completions.create(
-        model="gpt-3.5-turbo",
+        model="gpt-4o-mini",
         messages=[{
             "role": "system",
             "content": system_prompt
@@ -245,7 +245,7 @@ async def apply_correction_data(current: dict, correction: str) -> dict:
         "return the updated JSON with the same six keys only.")
 
     resp = openai.chat.completions.create(
-        model="gpt-3.5-turbo",
+        model="gpt-4o-mini",
         messages=[{
             "role": "system",
             "content": system_prompt
