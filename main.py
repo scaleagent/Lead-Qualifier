@@ -919,11 +919,11 @@ if contractor:
 """
 
 
-@app.get("/pdf/{convo_id}")
-def generate_pdf(convo_id: str):
-    """Generate PDF report for a conversation."""
-    path = f"/tmp/{convo_id}.pdf"
-    return FileResponse(path, media_type="application/pdf")
+# @app.get("/pdf/{convo_id}")
+# def generate_pdf(convo_id: str):
+#     """Generate PDF report for a conversation."""
+#     path = f"/tmp/{convo_id}.pdf"
+#     return FileResponse(path, media_type="application/pdf")
 
 
 # === Daily Digest System (COMMENTED OUT - NOT IMPLEMENTED YET) ===
