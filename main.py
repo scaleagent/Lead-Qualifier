@@ -37,6 +37,18 @@ from urllib.parse import quote
 # Set up clean logging format
 logging.basicConfig(format='%(asctime)s [%(levelname)s] %(message)s',
                     level=logging.INFO)
+# Create logger for this module
+logger = logging.getLogger(__name__)
+
+# Log startup
+logger.info("=" * 60)
+logger.info("SMS Lead Qualification Bot Starting")
+logger.info(
+    f"Environment: {'Production' if os.getenv('DATABASE_URL') else 'Development'}"
+)
+logger.info(f"Test Mode: {os.getenv('TEST_MODE', 'False')}")
+logger.info(f"Test Phone: {os.getenv('DIGEST_TEST_PHONE', 'Not set')}")
+logger.info("=" * 60)
 
 app = FastAPI()
 
