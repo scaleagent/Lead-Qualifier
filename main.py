@@ -8,29 +8,14 @@ import re
 import logging
 from datetime import datetime, timedelta
 
-from fastapi import FastAPI, Depends, Form, Response
-from fastapi.responses import PlainTextResponse, FileResponse, Response
-from sqlalchemy.future import select
-
-from openai import OpenAI
-from twilio.rest import Client
-from apscheduler.schedulers.background import BackgroundScheduler
+from fastapi import FastAPI
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-# --- Database & Repos imports ---
-from repos.database import async_engine, AsyncSessionLocal
-from repos.models import Base, Contractor, ConversationData
-from repos.contractor_repo import ContractorRepo
-from repos.conversation_repo import ConversationRepo
-from repos.message_repo import MessageRepo
-from repos.conversation_data_repo import ConversationDataRepo
+# --- Database setup ---
+from repos.database import async_engine
+from repos.models import Base
 
 from modules.digest.digest_service import run_daily_digest
-from modules.digest.api import router as digest_router
-from utils.messaging import send_message
-
-# --- Qualification Module Imports ---
-from modules.qualification import QualificationService
 
 # Set up clean logging format
 logging.basicConfig(format='%(asctime)s [%(levelname)s] %(message)s',
@@ -50,49 +35,16 @@ logger.info("=" * 60)
 
 app = FastAPI()
 
-# Include digest module router
+# Include all API routers
+from modules.digest.api import router as digest_router
+from api.webhooks import router as webhooks_router
+from api.contractors import router as contractors_router
+from api.health import router as health_router
+
+app.include_router(health_router)
+app.include_router(webhooks_router)
+app.include_router(contractors_router)
 app.include_router(digest_router)
-
-# === External API Clients ===
-openai = OpenAI(api_key=os.environ.get("OPENAI_API_KEY", ""))
-twilio_client = Client(
-    os.environ.get("TWILIO_ACCOUNT_SID", ""),
-    os.environ.get("TWILIO_AUTH_TOKEN", ""),
-)
-TWILIO_NUMBER = os.environ.get("TWILIO_PHONE_NUMBER", "")
-WA_SANDBOX_NUMBER = os.environ.get("WHATSAPP_SANDBOX_NUMBER", "")
-
-# === Phone Number Formatting for Channel Separation ===
-
-
-# === Helpers ===
-# def send_message(to_number: str, message: str, is_whatsapp: bool = False):
-#     """
-#     UNIFIED: Send message via SMS or WhatsApp using same logic.
-#     """
-#     # Format recipient based on channel
-#     if is_whatsapp:
-#         tw_to = f"whatsapp:{to_number}"
-#         from_number = WA_SANDBOX_NUMBER
-#         channel = "WhatsApp"
-#     else:
-#         tw_to = to_number
-#         from_number = TWILIO_NUMBER
-#         channel = "SMS"
-
-#     try:
-#         msg = twilio_client.messages.create(body=message,
-#                                             from_=from_number,
-#                                             to=tw_to)
-#         print(
-#             f"📤 Sent {channel} to {to_number} | SID: {msg.sid} | Status: {msg.status}"
-#         )
-#     except Exception:
-#         print(f"❌ Failed to send {channel} to {to_number}")
-#         traceback.print_exc()
-
-
-# === Message Classification (moved to modules/messaging/message_classifier.py) ===
 
 
 async def extract_qualification_data(history_string: str) -> dict:
@@ -211,35 +163,10 @@ async def on_startup():
     logging.info("Scheduled daily digest job every hour on the hour")
 
 
-@app.get("/", response_class=PlainTextResponse)
-def read_root():
-    return "✅ SMS-Lead-Qual API is running."
 
 
-async def get_session():
-    async with AsyncSessionLocal() as session:
-        yield session
 
 
-@app.get("/contractors", response_class=PlainTextResponse)
-async def list_contractors(session=Depends(get_session)):
-    """Debug endpoint to view stored contractor profiles"""
-    contractor_repo = ContractorRepo(session)
-    contractors = await contractor_repo.get_all()
-
-    if not contractors:
-        return "❌ No contractors found in database"
-
-    result = ["📋 STORED CONTRACTORS:"]
-    for c in contractors:
-        result.append(f"  ID: {c.id}")
-        result.append(f"  Name: {c.name}")
-        result.append(f"  Phone: {c.phone}")
-        result.append(f"  Address: {c.address or 'Not set'}")
-        result.append(f"  Created: {c.created_at}")
-        result.append("  " + "-" * 30)
-
-    return "\n".join(result)
 
 
 # ===== Takeover Command Handler =====
@@ -249,16 +176,7 @@ async def list_contractors(session=Depends(get_session)):
 # === Takeover Command Handling (moved to modules/messaging/webhook_handler.py) ===
 
 
-@app.post("/sms", response_class=PlainTextResponse)
-async def sms_webhook(From: str = Form(...),
-                      To: str = Form(...),
-                      Body: str = Form(...),
-                      session=Depends(get_session)):
-    """SMS/WhatsApp webhook handler - now using modular messaging system"""
-    from modules.messaging import MessageWebhookHandler
 
-    handler = MessageWebhookHandler(session)
-    return await handler.handle_webhook(From, To, Body)
 
 
 # In your SMS webhook, add this check for contractor messages:
