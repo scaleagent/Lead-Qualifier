@@ -13,7 +13,7 @@ from repos.message_repo import MessageRepo
 from repos.conversation_data_repo import ConversationDataRepo
 from utils.messaging import send_message
 
-from services.qualification_service import QualificationService
+from modules.qualification.qualification_service import QualificationService
 from services.contractor_service import ContractorService
 from services.command_handler import CommandHandler
 
