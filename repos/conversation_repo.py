@@ -81,7 +81,6 @@ class ConversationRepo:
         """
         stmt = select(Conversation).where(
             Conversation.contractor_id == contractor_id,
-            Conversation.status == "COLLECTING_NOTES",
-            Conversation.closed_at.is_(None))
+            Conversation.status == "COLLECTING_NOTES")
         result = await self.session.execute(stmt)
         return result.scalars().all()
