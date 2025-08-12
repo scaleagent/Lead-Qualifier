@@ -25,14 +25,9 @@ from repos.conversation_repo import ConversationRepo
 from repos.message_repo import MessageRepo
 from repos.conversation_data_repo import ConversationDataRepo
 
-from services.digest import run_daily_digest
-
+from modules.digest.digest_service import run_daily_digest
+from modules.digest.api import router as digest_router
 from utils.messaging import send_message
-
-## imports for pdf generation
-import hashlib
-import hmac
-from urllib.parse import quote
 
 # Set up clean logging format
 logging.basicConfig(format='%(asctime)s [%(levelname)s] %(message)s',
@@ -51,6 +46,9 @@ logger.info(f"Test Phone: {os.getenv('DIGEST_TEST_PHONE', 'Not set')}")
 logger.info("=" * 60)
 
 app = FastAPI()
+
+# Include digest module router
+app.include_router(digest_router)
 
 # === External API Clients ===
 openai = OpenAI(api_key=os.environ.get("OPENAI_API_KEY", ""))
@@ -772,7 +770,6 @@ async def sms_webhook(From: str = Form(...),
         print("🆕 NEW classification - creating fresh conversation")
         
         convo = await conv_repo.create_conversation(
-            contractor_id=contractor.id, customer_phone=customer_phone_db)onv_repo.create_conversation(
             contractor_id=contractor.id, customer_phone=customer_phone_db)
         print(f"   Created new conversation: {convo.id}")
 
@@ -932,210 +929,4 @@ print("📱 Supporting both SMS and WhatsApp channels with COMPLETE separation")
 print("🔧 Debug mode enabled with enhanced logging")
 # print("⏰ Daily digest scheduled for 6 PM")  # Commented out
 
-# ===== PDF Security Functions =====
 
-PDF_SECRET_KEY = os.environ.get("PDF_SECRET_KEY", "change-this-in-production")
-
-
-def generate_pdf_token(conversation_id: str,
-                       expires_in_hours: int = 24) -> str:
-    """
-    Generate a time-limited signed token for secure PDF access.
-    Token format: conversation_id:expiry_timestamp:signature
-    """
-    expiry = int(
-        (datetime.utcnow() + timedelta(hours=expires_in_hours)).timestamp())
-    message = f"{conversation_id}:{expiry}"
-    signature = hmac.new(PDF_SECRET_KEY.encode(), message.encode(),
-                         hashlib.sha256).hexdigest()
-    return f"{message}:{signature}"
-
-
-def verify_pdf_token(token: str) -> tuple[bool, str]:
-    """
-    Verify PDF access token and extract conversation_id.
-    Returns: (is_valid, conversation_id)
-    """
-    try:
-        parts = token.split(':')
-        if len(parts) != 3:
-            logging.warning(f"Invalid token format: {token}")
-            return False, ""
-
-        conversation_id, expiry_str, provided_signature = parts
-        expiry = int(expiry_str)
-
-        # Check if token has expired
-        if datetime.utcnow().timestamp() > expiry:
-            logging.info(
-                f"Token expired for conversation {conversation_id[:8]}...")
-            return False, ""
-
-        # Verify signature to prevent tampering
-        message = f"{conversation_id}:{expiry_str}"
-        expected_signature = hmac.new(PDF_SECRET_KEY.encode(),
-                                      message.encode(),
-                                      hashlib.sha256).hexdigest()
-
-        # Use constant-time comparison to prevent timing attacks
-        if hmac.compare_digest(expected_signature, provided_signature):
-            return True, conversation_id
-
-        logging.warning(
-            f"Invalid signature for conversation {conversation_id[:8]}...")
-        return False, ""
-
-    except Exception as e:
-        logging.error(f"Token verification error: {e}")
-        return False, ""
-
-
-def generate_pdf_url(conversation_id: str, base_url: str = None) -> str:
-    """
-    Generate a complete URL for PDF access with signed token.
-    Used in digest messages to provide secure PDF links.
-    """
-    if not base_url:
-        base_url = os.environ.get("APP_BASE_URL",
-                                  "https://your-app.herokuapp.com")
-
-    token = generate_pdf_token(conversation_id)
-    # URL-encode the token to handle special characters
-    return f"{base_url}/pdf/transcript?token={quote(token)}"
-
-
-# ===== PDF Endpoints =====
-
-
-@app.get("/pdf/transcript")
-async def get_transcript_pdf(token: str, session=Depends(get_session)):
-    """
-    Secure endpoint for PDF transcript generation.
-    Generates PDF on-demand to ensure most current data.
-
-    Usage: /pdf/transcript?token=SIGNED_TOKEN
-
-    The token contains:
-    - conversation_id
-    - expiry timestamp
-    - HMAC signature for security
-    """
-    from services.pdf_service import generate_conversation_pdf
-
-    # Verify the token
-    is_valid, conversation_id = verify_pdf_token(token)
-
-    if not is_valid:
-        logging.warning(
-            f"Invalid PDF access attempt with token: {token[:20]}...")
-        return PlainTextResponse(
-            "This link has expired or is invalid. Please request a new digest from your contractor.",
-            status_code=403)
-
-    try:
-        # Log successful access
-        logging.info(
-            f"Generating PDF for conversation {conversation_id[:8]}...")
-
-        # Generate the PDF with current data
-        pdf_bytes = await generate_conversation_pdf(session, conversation_id)
-
-        # Return PDF as streaming response
-        return Response(
-            content=pdf_bytes,
-            media_type="application/pdf",
-            headers={
-                # inline = display in browser, attachment = force download
-                "Content-Disposition":
-                f"inline; filename=lead_transcript_{conversation_id[:8]}.pdf",
-                # Cache for 5 minutes to avoid regenerating on refresh
-                "Cache-Control": "private, max-age=300",
-                # Security headers
-                "X-Content-Type-Options": "nosniff",
-                "X-Frame-Options": "DENY"
-            })
-
-    except ValueError as e:
-        # Conversation not found
-        logging.error(f"Conversation not found: {conversation_id}")
-        return PlainTextResponse(
-            "This conversation could not be found. It may have been deleted.",
-            status_code=404)
-
-    except Exception as e:
-        # Unexpected error
-        logging.error(f"PDF generation failed for {conversation_id}: {e}",
-                      exc_info=True)
-        return PlainTextResponse(
-            "An error occurred generating the PDF. Please try again later.",
-            status_code=500)
-
-
-@app.get("/pdf/test/{convo_id}")
-async def test_pdf_generation(convo_id: str, session=Depends(get_session)):
-    """
-    TEST ENDPOINT: Generate PDF directly without token (for development only).
-    Remove this endpoint in production!
-    """
-    if os.environ.get("ENVIRONMENT") == "production":
-        return PlainTextResponse("Not available in production",
-                                 status_code=404)
-
-    from services.pdf_service import generate_conversation_pdf
-
-    try:
-        pdf_bytes = await generate_conversation_pdf(session, convo_id)
-        return Response(content=pdf_bytes,
-                        media_type="application/pdf",
-                        headers={
-                            "Content-Disposition":
-                            f"inline; filename=test_{convo_id[:8]}.pdf"
-                        })
-    except Exception as e:
-        return PlainTextResponse(f"Error: {str(e)}", status_code=500)
-
-
-@app.post("/generate-pdf-link")
-async def generate_pdf_link_endpoint(conversation_id: str = Form(...)):
-    """
-    Admin endpoint to generate a PDF link for a specific conversation.
-    Useful for testing or manual link generation.
-    """
-    # Add authentication here if needed
-
-    url = generate_pdf_url(conversation_id)
-    return {
-        "conversation_id": conversation_id,
-        "pdf_url": url,
-        "expires_in": "24 hours",
-        "generated_at": datetime.utcnow().isoformat()
-    }
-
-
-@app.post("/monitor/trigger-digest/{contractor_id}")
-async def trigger_digest_manually(contractor_id: int,
-                                  session=Depends(get_session)):
-    """
-    Manually trigger digest for a specific contractor (for testing).
-    Only works if TEST_MODE env var is set.
-    Force-sends the digest for this contractor, ignoring the hour check.
-    """
-    if not os.getenv("TEST_MODE"):
-        return {"error": "Manual trigger only available in TEST_MODE"}
-
-    logger.info(
-        f"MONITOR: Manually triggering digest for contractor {contractor_id} (force override)"
-    )
-
-    try:
-        # Force = True, and target only this contractor
-        await run_daily_digest(force=True, only_contractor_id=contractor_id)
-        return {
-            "status": "success",
-            "message":
-            f"Forced digest sent (or attempted) for contractor {contractor_id}",
-            "note": "Check logs for details"
-        }
-    except Exception as e:
-        logger.error(f"Failed to trigger digest: {e}")
-        return {"status": "error", "error": str(e)}
