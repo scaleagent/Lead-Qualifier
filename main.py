@@ -29,6 +29,9 @@ from modules.digest.digest_service import run_daily_digest
 from modules.digest.api import router as digest_router
 from utils.messaging import send_message
 
+# --- Qualification Module Imports ---
+from modules.qualification import QualificationService
+
 # Set up clean logging format
 logging.basicConfig(format='%(asctime)s [%(levelname)s] %(message)s',
                     level=logging.INFO)
@@ -59,11 +62,7 @@ twilio_client = Client(
 TWILIO_NUMBER = os.environ.get("TWILIO_PHONE_NUMBER", "")
 WA_SANDBOX_NUMBER = os.environ.get("WHATSAPP_SANDBOX_NUMBER", "")
 
-# === Qualification Schema ===
-REQUIRED_FIELDS = ["job_type", "property_type", "urgency", "address", "access"]
-
-
-# === Phone Number Formatting (moved to modules/messaging/channel_manager.py) ===
+# === Phone Number Formatting for Channel Separation ===
 
 
 # === Helpers ===
@@ -170,6 +169,17 @@ async def apply_correction_data(current: dict, correction: str) -> dict:
     return updated
 
 
+async def classify_message(message_text: str, history_string: str) -> str:
+    """
+    Classify incoming message into conversation states.
+    """
+    # Placeholder for actual message classification logic
+    # This would involve using an LLM or rule-based system
+    # to determine the intent of the message (e.g., provide info, confirm, correct)
+    print(f" Classifying message: '{message_text}'")
+    return "QUALIFYING"  # Default for now
+
+
 def is_affirmative(text: str) -> bool:
     """Check if text indicates affirmative response."""
     return bool(
@@ -246,7 +256,7 @@ async def sms_webhook(From: str = Form(...),
                       session=Depends(get_session)):
     """SMS/WhatsApp webhook handler - now using modular messaging system"""
     from modules.messaging import MessageWebhookHandler
-    
+
     handler = MessageWebhookHandler(session)
     return await handler.handle_webhook(From, To, Body)
 
@@ -291,5 +301,3 @@ print("🚀 SMS Lead Qualification Bot started successfully!")
 print("📱 Supporting both SMS and WhatsApp channels with COMPLETE separation")
 print("🔧 Debug mode enabled with enhanced logging")
 # print("⏰ Daily digest scheduled for 6 PM")  # Commented out
-
-
