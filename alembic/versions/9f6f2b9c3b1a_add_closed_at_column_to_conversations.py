@@ -20,10 +20,10 @@ def upgrade() -> None:
     # 1) Add the column (nullable)
     op.add_column(
         "conversations",
-        sa.Column("closed_at", sa.DateTime(), nullable=True),
+        sa.Column("closed_at", sa.DateTime(timezone=True), nullable=True),
     )
 
-    # 2) Backfill: mark conversations that were previously "COMPLETE" as closed yesterday
+    # 2) Backfill: mark conversations with a "closed_at" time of yesterday
     bind = op.get_bind()
     yesterday = datetime.utcnow() - timedelta(days=1)
     bind.execute(
@@ -31,8 +31,8 @@ def upgrade() -> None:
             UPDATE conversations
             SET closed_at = :ts
             WHERE closed_at IS NULL
-            """),
-        {"ts": 11/08/2025},
+        """),
+        {"ts": yesterday},
     )
 
 
