@@ -535,22 +535,10 @@ async def sms_webhook(From: str = Form(...),
             logger.info(f"  Target phone: {target_phone_clean}")
             logger.info(f"  Target DB format: {target_phone_db}")
 
-            # Check for existing conversation
-            old_convo = await conv_repo.get_active_conversation(
-                contractor.id, target_phone_db)
-            if old_convo:
-                logger.info(f"  🔄 Found existing conversation: {old_convo.id}")
-                logger.info(f"    Status: {old_convo.status}")
-                logger.info(f"    Created: {old_convo.created_at}")
-                logger.info(f"  Closing existing conversation...")
-                await conv_repo.close_conversation(old_convo.id)
-                logger.info(f"  ✅ Closed conversation {old_convo.id}")
-            else:
-                logger.info(f"  No existing conversation found")
-
-            # Create new conversation
+            # Create new conversation (automatically closes any existing ones)
             convo = await conv_repo.create_conversation(
                 contractor_id=contractor.id, customer_phone=target_phone_db)
+            logger.info(f"  🆕 Created new conversation: {convo.id}")
             logger.info(f"  🆕 Created new conversation: {convo.id}")
 
             # Send introduction message
@@ -782,11 +770,9 @@ async def sms_webhook(From: str = Form(...),
     # Handle NEW classification
     if classification == "NEW":
         print("🆕 NEW classification - creating fresh conversation")
-        if old_convo:
-            print(f"   Closing old conversation: {old_convo.id}")
-            await conv_repo.close_conversation(old_convo.id)
-
+        
         convo = await conv_repo.create_conversation(
+            contractor_id=contractor.id, customer_phone=customer_phone_db)onv_repo.create_conversation(
             contractor_id=contractor.id, customer_phone=customer_phone_db)
         print(f"   Created new conversation: {convo.id}")
 

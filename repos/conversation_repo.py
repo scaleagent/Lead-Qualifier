@@ -31,6 +31,13 @@ class ConversationRepo:
 
     async def create_conversation(self, contractor_id: int,
                                   customer_phone: str):
+        # First, close any existing active conversation for this phone pair
+        existing = await self.get_active_conversation(contractor_id, customer_phone)
+        if existing:
+            existing.status = "COMPLETE"
+            existing.updated_at = datetime.utcnow()
+            
+        # Create new conversation
         convo = Conversation(contractor_id=contractor_id,
                              customer_phone=customer_phone)
         self.session.add(convo)
@@ -44,6 +51,27 @@ class ConversationRepo:
             convo.status = "COMPLETE"
             convo.updated_at = datetime.utcnow()
             await self.session.commit()
+
+    async def close_all_active_for_customer(self, customer_phone: str):
+        """
+        Close all active conversations for a customer phone number 
+        (across all contractors). Useful when customer starts fresh.
+        """
+        stmt = select(Conversation).where(
+            Conversation.customer_phone == customer_phone,
+            Conversation.status != "COMPLETE"
+        )
+        result = await self.session.execute(stmt)
+        active_conversations = result.scalars().all()
+        
+        for convo in active_conversations:
+            convo.status = "COMPLETE"
+            convo.updated_at = datetime.utcnow()
+        
+        if active_conversations:
+            await self.session.commit()
+        
+        return len(active_conversations)
 
     # --- New method for fetching ongoing (collecting-notes) leads ---
     async def get_collecting_notes_for_contractor(
