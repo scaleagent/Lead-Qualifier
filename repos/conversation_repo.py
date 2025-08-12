@@ -16,7 +16,7 @@ class ConversationRepo:
         stmt = (select(Conversation).where(
             Conversation.contractor_id == contractor_id,
             Conversation.customer_phone == customer_phone,
-            Conversation.status != "COMPLETE",
+            Conversation.closed_at.is_(None),
         ))
         result = await self.session.execute(stmt)
         return result.scalars().first()
@@ -24,7 +24,7 @@ class ConversationRepo:
     async def get_active_by_customer(self, customer_phone: str):
         stmt = (select(Conversation).where(
             Conversation.customer_phone == customer_phone,
-            Conversation.status != "COMPLETE",
+            Conversation.closed_at.is_(None),
         ))
         result = await self.session.execute(stmt)
         return result.scalars().first()
@@ -34,7 +34,7 @@ class ConversationRepo:
         # First, close any existing active conversation for this phone pair
         existing = await self.get_active_conversation(contractor_id, customer_phone)
         if existing:
-            existing.status = "COMPLETE"
+            existing.closed_at = datetime.utcnow()
             existing.updated_at = datetime.utcnow()
             
         # Create new conversation
@@ -48,7 +48,7 @@ class ConversationRepo:
     async def close_conversation(self, conversation_id: str):
         convo = await self.session.get(Conversation, conversation_id)
         if convo:
-            convo.status = "COMPLETE"
+            convo.closed_at = datetime.utcnow()
             convo.updated_at = datetime.utcnow()
             await self.session.commit()
 
@@ -59,13 +59,13 @@ class ConversationRepo:
         """
         stmt = select(Conversation).where(
             Conversation.customer_phone == customer_phone,
-            Conversation.status != "COMPLETE"
+            Conversation.closed_at.is_(None)
         )
         result = await self.session.execute(stmt)
         active_conversations = result.scalars().all()
         
         for convo in active_conversations:
-            convo.status = "COMPLETE"
+            convo.closed_at = datetime.utcnow()
             convo.updated_at = datetime.utcnow()
         
         if active_conversations:
@@ -81,6 +81,7 @@ class ConversationRepo:
         """
         stmt = select(Conversation).where(
             Conversation.contractor_id == contractor_id,
-            Conversation.status == "COLLECTING_NOTES")
+            Conversation.status == "COLLECTING_NOTES",
+            Conversation.closed_at.is_(None))
         result = await self.session.execute(stmt)
         return result.scalars().all()

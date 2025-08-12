@@ -47,6 +47,7 @@ class Conversation(Base):
                            nullable=False)
     customer_phone = Column(String, nullable=False)
     status = Column(String, default="QUALIFYING", nullable=False)
+    closed_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime,
                         default=datetime.utcnow,
