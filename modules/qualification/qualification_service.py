@@ -4,8 +4,9 @@ import json
 import logging
 from typing import Dict, List, Optional
 from openai import OpenAI
+from sqlalchemy.ext.asyncio import AsyncSession
 from .contractor_profiles import (
-    get_contractor_profile, 
+    get_contractor_profile,
     get_active_categories_for_profile,
     get_required_categories_for_profile,
     get_category_config,
@@ -17,8 +18,11 @@ logger = logging.getLogger(__name__)
 class QualificationService:
     """Service for qualifying leads based on contractor profiles."""
 
-    def __init__(self):
-        self.openai_client = OpenAI()
+    def __init__(self, session: AsyncSession, openai_client):
+        self.session = session
+        self.openai_client = openai_client
+        self.data_extractor = DataExtractor()
+        self.flow_manager = FlowManager()
 
     def get_profile_specific_prompt(self, contractor_profile: str) -> str:
         """Generate AI assistant prompt based on contractor profile."""
