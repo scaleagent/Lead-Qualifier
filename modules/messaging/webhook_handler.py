@@ -14,8 +14,8 @@ from repos.conversation_data_repo import ConversationDataRepo
 from utils.messaging import send_message
 
 from modules.qualification.qualification_service import QualificationService
-from services.contractor_service import ContractorService
-from services.command_handler import CommandHandler
+from modules.contractor.contractor_service import ContractorService
+from modules.contractor.command_handler import CommandHandler
 
 from .channel_manager import ChannelManager
 from .message_classifier import MessageClassifier
