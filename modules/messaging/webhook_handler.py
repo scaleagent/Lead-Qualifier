@@ -31,6 +31,7 @@ class MessageWebhookHandler:
         # Initialize repositories
         self.contractor_repo = ContractorRepo(session)
         self.conversation_repo = ConversationRepo(session)
+        self.conv_repo = ConversationRepo(session)  # Add this alias used in reach_out_command
         self.msg_repo = MessageRepo(session)
         self.data_repo = ConversationDataRepo(session)
 
