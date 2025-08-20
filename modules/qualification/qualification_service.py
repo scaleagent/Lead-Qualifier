@@ -15,6 +15,17 @@ from .contractor_profiles import (
 
 logger = logging.getLogger(__name__)
 
+
+class DataExtractor:
+    """Handles data extraction from conversation history"""
+    pass
+
+
+class FlowManager:
+    """Manages conversation flow states"""
+    pass
+
+
 class QualificationService:
     """Service for qualifying leads based on contractor profiles."""
 
