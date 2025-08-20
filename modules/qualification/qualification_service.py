@@ -1,250 +1,147 @@
-
 # modules/qualification/qualification_service.py
 
+import json
 import logging
-from datetime import datetime
-from typing import Optional, Tuple
-from sqlalchemy.ext.asyncio import AsyncSession
+from typing import Dict, List, Optional
 from openai import OpenAI
-
-from repos.models import Conversation, ConversationData
-from repos.message_repo import MessageRepo
-from repos.conversation_data_repo import ConversationDataRepo
-from utils.messaging import send_message
-from .data_extractor import DataExtractor
-from .flow_manager import FlowManager
+from .contractor_profiles import (
+    get_contractor_profile, 
+    get_active_categories_for_profile,
+    get_required_categories_for_profile,
+    get_category_config,
+    MASTER_DATA_CATEGORIES
+)
 
 logger = logging.getLogger(__name__)
 
-
 class QualificationService:
-    """Main service for handling lead qualification process."""
-    
-    def __init__(self, session: AsyncSession, openai_client: OpenAI):
-        self.session = session
-        self.data_extractor = DataExtractor(openai_client)
-        self.flow_manager = FlowManager()
-        self.msg_repo = MessageRepo(session)
-        self.data_repo = ConversationDataRepo(session)
-    
-    async def process_qualification(
-        self,
-        conversation: Conversation,
-        message_body: str,
-        contractor,
-        customer_phone_clean: str,
-        customer_phone_db: str,
-        system_phone_db: str,
-        is_whatsapp: bool
-    ) -> bool:
-        """
-        Main entry point for processing qualification messages.
-        
-        Returns:
-            bool: True if message was handled, False if not
-        """
-        logger.info(f"Processing qualification for conversation {conversation.id}")
-        
-        # Handle CONFIRMING state
-        if conversation.status == "CONFIRMING":
-            return await self._handle_confirmation_state(
-                conversation, message_body, contractor,
-                customer_phone_clean, customer_phone_db, system_phone_db, is_whatsapp
+    """Service for qualifying leads based on contractor profiles."""
+
+    def __init__(self):
+        self.openai_client = OpenAI()
+
+    def get_profile_specific_prompt(self, contractor_profile: str) -> str:
+        """Generate AI assistant prompt based on contractor profile."""
+        profile_config = get_contractor_profile(contractor_profile)
+        active_categories = get_active_categories_for_profile(contractor_profile)
+
+        # Build list of information to collect
+        info_to_collect = []
+        for category in active_categories:
+            category_config = get_category_config(category)
+            if category_config:
+                info_to_collect.append(f"- {category_config['description']}")
+
+        prompt = f"""You are a professional assistant working for a {profile_config['name']}.
+
+Your role is to gather comprehensive information from potential customers to help your contractor provide accurate quotes and service. You are experienced in {profile_config['name'].lower()} work and understand what information is most valuable.
+
+PERSONALITY: {profile_config['personality']}
+
+INFORMATION TO COLLECT:
+{chr(10).join(info_to_collect)}
+
+GUIDELINES:
+- Be conversational and professional, like an experienced assistant
+- Ask follow-up questions to get complete information
+- Only give advice if it helps you gather more information
+- Do not provide safety warnings or technical advice
+- Focus on understanding the customer's needs and situation
+- Ask one clear question at a time
+- Be helpful and personable while staying focused on information gathering
+
+Remember: Your goal is to collect comprehensive information so your contractor can provide the best possible service and accurate pricing."""
+
+        return prompt
+
+    async def extract_qualification_data(self, conversation_history: str, contractor_profile: str) -> Dict:
+        """Extract qualification data from conversation using profile-specific categories."""
+        active_categories = get_active_categories_for_profile(contractor_profile)
+
+        # Build extraction prompt with only active categories
+        categories_description = {}
+        for category in active_categories:
+            config = get_category_config(category)
+            if config:
+                categories_description[category] = config['description']
+
+        system_prompt = f"""Extract information from the customer's messages into these specific categories:
+
+{json.dumps(categories_description, indent=2)}
+
+Rules:
+- Only extract information explicitly mentioned by the customer
+- If not mentioned, set value to empty string
+- Put any additional customer comments into 'notes'
+- Respond ONLY with a JSON object containing these exact keys: {', '.join(active_categories + ['notes'])}"""
+
+        try:
+            response = self.openai_client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": f"Conversation:\n{conversation_history}"}
+                ],
+                temperature=0.3,  # Slight variability for more natural responses
+                max_tokens=500
             )
-        
-        # Handle COLLECTING_NOTES state
-        if conversation.status == "COLLECTING_NOTES":
-            return await self._handle_notes_collection_state(
-                conversation, message_body,
-                customer_phone_clean, customer_phone_db, system_phone_db, is_whatsapp
+
+            extracted_data = json.loads(response.choices[0].message.content)
+        except (json.JSONDecodeError, Exception) as e:
+            logger.error(f"Failed to extract qualification data: {e}")
+            extracted_data = {}
+
+        # Ensure all active categories are present
+        for category in active_categories + ['notes']:
+            extracted_data.setdefault(category, "")
+
+        return extracted_data
+
+    def is_qualified(self, data: Dict, contractor_profile: str) -> bool:
+        """Check if lead is qualified based on profile requirements."""
+        required_categories = get_required_categories_for_profile(contractor_profile)
+        return all(data.get(category) for category in required_categories)
+
+    async def generate_response(self, message: str, conversation_history: str, contractor_profile: str, current_data: Dict) -> str:
+        """Generate AI response using profile-specific personality and focus."""
+        system_prompt = self.get_profile_specific_prompt(contractor_profile)
+
+        # Add context about what information we already have
+        active_categories = get_active_categories_for_profile(contractor_profile)
+        collected_info = []
+        missing_info = []
+
+        for category in active_categories:
+            config = get_category_config(category)
+            if config and current_data.get(category): # Use current_data here
+                collected_info.append(f"✓ {config['description']}")
+            elif config:
+                missing_info.append(f"? {config['description']}")
+
+        context = f"""
+CURRENT CONVERSATION STATUS:
+Information collected: {', '.join(collected_info) if collected_info else 'None yet'}
+Still needed: {', '.join(missing_info) if missing_info else 'All required info collected'}
+
+CONVERSATION HISTORY:
+{conversation_history}
+
+LATEST MESSAGE: {message}
+
+Respond naturally and professionally, focusing on gathering the missing information."""
+
+        try:
+            response = self.openai_client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": context}
+                ],
+                temperature=0.4,  # Adding variability for more personable responses
+                max_tokens=200
             )
-        
-        # Handle normal QUALIFYING state
-        return await self._handle_qualifying_state(
-            conversation, contractor,
-            customer_phone_clean, customer_phone_db, system_phone_db, is_whatsapp
-        )
-    
-    async def _handle_confirmation_state(
-        self,
-        conversation: Conversation,
-        message_body: str,
-        contractor,
-        customer_phone_clean: str,
-        customer_phone_db: str,
-        system_phone_db: str,
-        is_whatsapp: bool
-    ) -> bool:
-        """Handle customer confirmation or corrections."""
-        logger.debug(f"Handling confirmation state for conversation {conversation.id}")
-        
-        if self.flow_manager.is_affirmative(message_body):
-            logger.info("Customer confirmed qualification data - moving to notes collection")
-            
-            follow_up = (
-                "Thanks! If there's any other important info—parking, pets, special access—"
-                "just reply here. When you're done, reply 'No'."
-            )
-            
-            await self._send_and_log_message(
-                system_phone_db, customer_phone_db, follow_up,
-                "outbound", conversation.id
-            )
-            send_message(customer_phone_clean, follow_up, is_whatsapp)
-            
-            conversation.status = "COLLECTING_NOTES"
-            await self.session.commit()
-            
-        else:
-            logger.info("Customer provided corrections - updating qualification data")
-            
-            # Get conversation history and apply corrections
-            full_msgs = await self.msg_repo.get_all_conversation_messages(conversation.id)
-            history = "\n".join(f"{'Customer' if d=='inbound' else 'AI'}: {b}" for d, b in full_msgs)
-            
-            # Extract current data and apply corrections
-            current_data = await self.data_extractor.extract_qualification_data(history)
-            updated_data = await self.data_extractor.apply_correction_data(current_data, message_body)
-            
-            # Update stored data
-            await self.data_repo.upsert(
-                conversation_id=conversation.id,
-                contractor_id=contractor.id,
-                customer_phone=customer_phone_db,
-                data_dict=updated_data,
-                qualified=self.flow_manager.is_qualified(updated_data),
-                job_title=updated_data.get("job_type")
-            )
-            
-            # Show updated summary
-            summary = self.flow_manager.generate_summary(updated_data)
-            await self._send_and_log_message(
-                system_phone_db, customer_phone_db, summary,
-                "outbound", conversation.id
-            )
-            send_message(customer_phone_clean, summary, is_whatsapp)
-        
-        return True
-    
-    async def _handle_notes_collection_state(
-        self,
-        conversation: Conversation,
-        message_body: str,
-        customer_phone_clean: str,
-        customer_phone_db: str,
-        system_phone_db: str,
-        is_whatsapp: bool
-    ) -> bool:
-        """Handle additional notes collection."""
-        logger.debug(f"Handling notes collection state for conversation {conversation.id}")
-        
-        if self.flow_manager.is_negative(message_body):
-            logger.info("Customer finished notes collection - completing conversation")
-            
-            closing = "Great—thanks! I'll pass this along to your contractor. ✅"
-            await self._send_and_log_message(
-                system_phone_db, customer_phone_db, closing,
-                "outbound", conversation.id
-            )
-            send_message(customer_phone_clean, closing, is_whatsapp)
-            
-            # Mark conversation as complete
-            conversation.status = "COMPLETE"
-            await self.session.commit()
-            
-        else:
-            logger.info("Adding customer message to notes")
-            
-            # Add to notes
-            cd: ConversationData = await self.session.get(ConversationData, conversation.id)
-            if cd:
-                existing_notes = cd.data_json.get("notes", "")
-                combined_notes = (existing_notes + "\n" + message_body).strip()
-                cd.data_json["notes"] = combined_notes
-                cd.last_updated = datetime.utcnow()
-                await self.session.commit()
-            
-            prompt = "Anything else to add? If not, reply 'No'."
-            await self._send_and_log_message(
-                system_phone_db, customer_phone_db, prompt,
-                "outbound", conversation.id
-            )
-            send_message(customer_phone_clean, prompt, is_whatsapp)
-        
-        return True
-    
-    async def _handle_qualifying_state(
-        self,
-        conversation: Conversation,
-        contractor,
-        customer_phone_clean: str,
-        customer_phone_db: str,
-        system_phone_db: str,
-        is_whatsapp: bool
-    ) -> bool:
-        """Handle normal qualification data collection."""
-        logger.debug(f"Handling qualifying state for conversation {conversation.id}")
-        
-        # Extract qualification data from full conversation
-        full_msgs = await self.msg_repo.get_all_conversation_messages(conversation.id)
-        history = "\n".join(f"{'Customer' if d=='inbound' else 'AI'}: {b}" for d, b in full_msgs)
-        data = await self.data_extractor.extract_qualification_data(history)
-        
-        logger.debug(f"Extracted data: {data}")
-        
-        # Store/update the qualification data
-        await self.data_repo.upsert(
-            conversation_id=conversation.id,
-            contractor_id=contractor.id,
-            customer_phone=customer_phone_db,
-            data_dict=data,
-            qualified=self.flow_manager.is_qualified(data),
-            job_title=data.get("job_type")
-        )
-        
-        # Check if we need more information
-        missing_fields = self.flow_manager.get_missing_fields(data)
-        logger.debug(f"Missing fields: {missing_fields}")
-        
-        if missing_fields:
-            # Ask for missing information
-            prompt = self.flow_manager.generate_prompt(data)
-            if prompt:
-                logger.debug(f"Asking for missing info: {prompt}")
-                await self._send_and_log_message(
-                    system_phone_db, customer_phone_db, prompt,
-                    "outbound", conversation.id
-                )
-                send_message(customer_phone_clean, prompt, is_whatsapp)
-        else:
-            # All fields collected - show summary for confirmation
-            logger.info("All fields collected - showing summary for confirmation")
-            summary = self.flow_manager.generate_summary(data)
-            
-            await self._send_and_log_message(
-                system_phone_db, customer_phone_db, summary,
-                "outbound", conversation.id
-            )
-            send_message(customer_phone_clean, summary, is_whatsapp)
-            
-            conversation.status = "CONFIRMING"
-            await self.session.commit()
-        
-        return True
-    
-    async def _send_and_log_message(
-        self,
-        sender: str,
-        receiver: str,
-        body: str,
-        direction: str,
-        conversation_id: str
-    ) -> None:
-        """Helper to send and log messages."""
-        await self.msg_repo.create_message(
-            sender=sender,
-            receiver=receiver,
-            body=body,
-            direction=direction,
-            conversation_id=conversation_id
-        )
+
+            return response.choices[0].message.content.strip()
+        except Exception as e:
+            logger.error(f"Failed to generate AI response: {e}")
+            return "Thanks for that information. Could you tell me more about what work you need done?"

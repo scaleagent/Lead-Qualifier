@@ -28,6 +28,7 @@ class Contractor(Base):
     phone = Column(String, unique=True, nullable=False)
     assistant_phone = Column(String, unique=True, nullable=False)
     address = Column(String, nullable=True)
+    contractor_profile = Column(String, nullable=False, default="general_contractor")
     digest_config = Column(JSON, nullable=False, default=dict)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime,
