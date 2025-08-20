@@ -5,7 +5,7 @@ import json
 import logging
 from typing import Dict
 from openai import OpenAI
-from .config import REQUIRED_FIELDS, OPENAI_MODEL, OPENAI_TEMPERATURE, OPENAI_MAX_TOKENS
+from .config import OPENAI_MODEL, OPENAI_TEMPERATURE, OPENAI_MAX_TOKENS
 
 logger = logging.getLogger(__name__)
 
@@ -58,9 +58,8 @@ class DataExtractor:
             logger.error(f"Error extracting qualification data: {e}")
             data = {}
 
-        # Ensure all required keys exist
-        for key in REQUIRED_FIELDS + ["notes"]:
-            data.setdefault(key, "")
+        # Ensure notes field exists (other fields will be handled by qualification service)
+        data.setdefault("notes", "")
 
         return data
 
@@ -107,8 +106,9 @@ class DataExtractor:
             logger.error(f"Error applying correction: {e}")
             updated = current
 
-        # Ensure all required keys exist
-        for key in REQUIRED_FIELDS + ["notes"]:
-            updated.setdefault(key, current.get(key, ""))
+        # Ensure notes field exists and preserve all existing keys
+        updated.setdefault("notes", current.get("notes", ""))
+        for key in current:
+            updated.setdefault(key, current[key])
 
         return updated

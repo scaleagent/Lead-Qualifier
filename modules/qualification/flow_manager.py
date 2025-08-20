@@ -4,7 +4,7 @@
 import re
 import logging
 from typing import Dict, List
-from .config import REQUIRED_FIELDS, AFFIRMATIVE_PATTERNS, NEGATIVE_PATTERNS
+from .config import AFFIRMATIVE_PATTERNS, NEGATIVE_PATTERNS
 
 logger = logging.getLogger(__name__)
 
@@ -12,28 +12,28 @@ logger = logging.getLogger(__name__)
 class FlowManager:
     """Manages the qualification flow state and determines next steps."""
     
-    def is_qualified(self, data: Dict[str, str]) -> bool:
+    def is_qualified(self, data: Dict[str, str], required_fields: List[str]) -> bool:
         """Check if all required fields are filled."""
-        qualified = all(data.get(k) for k in REQUIRED_FIELDS)
-        logger.debug(f"Qualification check: {qualified} (filled: {sum(1 for k in REQUIRED_FIELDS if data.get(k))} of {len(REQUIRED_FIELDS)})")
+        qualified = all(data.get(k) for k in required_fields)
+        logger.debug(f"Qualification check: {qualified} (filled: {sum(1 for k in required_fields if data.get(k))} of {len(required_fields)})")
         return qualified
     
-    def get_missing_fields(self, data: Dict[str, str]) -> List[str]:
+    def get_missing_fields(self, data: Dict[str, str], required_fields: List[str]) -> List[str]:
         """Get list of missing required fields."""
-        missing = [k for k in REQUIRED_FIELDS if not data.get(k)]
+        missing = [k for k in required_fields if not data.get(k)]
         logger.debug(f"Missing fields: {missing}")
         return missing
     
-    def generate_prompt(self, data: Dict[str, str]) -> str:
+    def generate_prompt(self, data: Dict[str, str], required_fields: List[str]) -> str:
         """Generate appropriate prompt based on current qualification state."""
-        missing = self.get_missing_fields(data)
+        missing = self.get_missing_fields(data, required_fields)
         
         if not missing:
             logger.debug("All fields collected - should show summary")
             return None
         
         # If no fields collected yet, ask for job type
-        if all(data[k] == "" for k in REQUIRED_FIELDS):
+        if all(data[k] == "" for k in required_fields):
             return "Please provide your job type."
         
         # Ask for up to 2 missing fields at once
@@ -48,11 +48,12 @@ class FlowManager:
         logger.debug(f"Generated prompt for missing fields: {next_fields}")
         return prompt
     
-    def generate_summary(self, data: Dict[str, str]) -> str:
+    def generate_summary(self, data: Dict[str, str], required_fields: List[str]) -> str:
         """Generate summary of collected qualification data."""
         bullets = [
             f"• {f.replace('_', ' ').title()}: {data[f]}"
-            for f in REQUIRED_FIELDS
+            for f in required_fields
+            if data.get(f)  # Only include fields that have data
         ]
         summary = "Here's what I have so far:\n" + "\n".join(bullets) + "\nIs that correct?"
         logger.debug("Generated qualification summary")
