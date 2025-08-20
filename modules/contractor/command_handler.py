@@ -116,7 +116,7 @@ class CommandHandler:
                     "To get started, please tell me the type of job you need.")
 
             # Get system phone for this contractor
-            system_phone_db = contractor.phone_number  # Use the correct field name
+            system_phone_db = contractor.assistant_phone_number
             
             await self.msg_repo.create_message(
                 sender=system_phone_db, 

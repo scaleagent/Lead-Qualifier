@@ -36,4 +36,4 @@ async def sms_webhook(From: str = Form(...),
     response_text = await handler.handle_webhook(From, To, Body)
     
     # Return 204 No Content for SMS webhooks (Twilio requirement)
-    return Response(status_code=204)
+    return Response(content=response_text, status_code=204)
