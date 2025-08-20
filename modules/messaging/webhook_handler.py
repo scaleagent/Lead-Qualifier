@@ -84,29 +84,30 @@ class MessageWebhookHandler:
 
         response_phone = self.channel_manager.get_response_phone(from_phone_clean)
 
-        logger.info(f"✅ Message from contractor: {contractor.name} (ID: {contractor.id})")
+        # Handle contractor messages
+        if contractor:
+            logger.info(f"✅ Message from contractor: {contractor.name} (ID: {contractor.id})")
 
-        # Check for contractor commands
-        if self.command_handler.is_contractor_command(body):
-            # Handle takeover command
-            takeover_response = await self.command_handler.handle_takeover_command(
-                body, contractor
-            )
-            if takeover_response:
-                send_message(response_phone, takeover_response, is_whatsapp)
-                return Response(status_code=204)
+            # Check for contractor commands
+            if self.command_handler.is_contractor_command(body):
+                # Handle takeover command
+                takeover_response = await self.command_handler.handle_takeover_command(
+                    body, contractor
+                )
+                if takeover_response:
+                    send_message(from_phone_clean, takeover_response, is_whatsapp)
+                    return Response(status_code=204)
 
-            # Handle reach out command
-            reach_out_response = await self.command_handler.handle_reach_out_command(
-                body, contractor, is_whatsapp
-            )
-            if reach_out_response:
-                send_message(response_phone, reach_out_response, is_whatsapp)
-                return Response(status_code=204)
+                # Handle reach out command
+                reach_out_response = await self.command_handler.handle_reach_out_command(
+                    body, contractor, is_whatsapp
+                )
+                if reach_out_response:
+                    send_message(from_phone_clean, reach_out_response, is_whatsapp)
+                    return Response(status_code=204)
 
-        # No recognized command - default contractor response
-        logger.info(f"  ℹ️ No recognized contractor command in message: '{body}'")
-        return Response(status_code=204)
+            # No recognized command - default contractor response
+            return Response(status_code=204)
 
         return Response(status_code=204)
 
