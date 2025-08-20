@@ -116,7 +116,10 @@ class CommandHandler:
                     "To get started, please tell me the type of job you need.")
 
             # Get system phone for this contractor
-            system_phone_db = contractor.assistant_phone_number
+            system_phone_db = getattr(contractor, 'assistant_phone_number', None)
+            if not system_phone_db:
+                logger.error(f"❌ Contractor {contractor.name} has no assistant phone number configured")
+                return f"❌ Unable to reach out - assistant phone not configured for {contractor.name}"
             
             await self.msg_repo.create_message(
                 sender=system_phone_db, 
