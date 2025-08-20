@@ -30,10 +30,23 @@ async def sms_webhook(From: str = Form(...),
     This endpoint handles all incoming SMS and WhatsApp messages,
     routing them through the modular messaging system.
     """
-    logger.info(f"Received message from {From} to {To}")
+    logger.info("🚀 SMS WEBHOOK ENDPOINT HIT!")
+    logger.info(f"From: {From}")
+    logger.info(f"To: {To}")
+    logger.info(f"Body: {Body}")
     
-    handler = MessageWebhookHandler(session)
-    response_text = await handler.handle_webhook(From, To, Body)
-    
-    # Return 204 No Content for SMS webhooks (Twilio requirement)
-    return Response(content=response_text, status_code=204)
+    try:
+        handler = MessageWebhookHandler(session)
+        await handler.handle_webhook(From, To, Body)
+        
+        logger.info("✅ Webhook handled successfully")
+        # Return 204 No Content for SMS webhooks (Twilio requirement)
+        return Response(status_code=204)
+        
+    except Exception as e:
+        logger.error(f"❌ Webhook handler error: {e}")
+        logger.error(f"Error type: {type(e).__name__}")
+        import traceback
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        # Still return 204 to Twilio to avoid retries
+        return Response(status_code=204)

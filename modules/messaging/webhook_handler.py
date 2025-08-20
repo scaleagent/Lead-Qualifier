@@ -44,7 +44,7 @@ class MessageWebhookHandler:
         self.channel_manager = ChannelManager()
         self.classifier = MessageClassifier()
 
-    async def handle_webhook(self, from_number: str, to_number: str, body: str) -> Response:
+    async def handle_webhook(self, from_number: str, to_number: str, body: str) -> None:
         """Main webhook handler entry point"""
         logger.info("=" * 50)
         logger.info("🔔 NEW SMS/WHATSAPP WEBHOOK CALL")
@@ -68,18 +68,18 @@ class MessageWebhookHandler:
         contractor = await self.contractor_service.identify_contractor(customer_phone_db)
 
         if contractor:
-            return await self.handle_contractor_message(
+            await self.handle_contractor_message(
                 contractor, body, from_phone_clean, is_whatsapp, customer_phone_db, system_phone_db
             )
         else:
-            return await self.handle_customer_message(
+            await self.handle_customer_message(
                 from_phone_clean, body, is_whatsapp, customer_phone_db, system_phone_db
             )
 
     async def handle_contractor_message(
         self, contractor, body: str, from_phone_clean: str,
         is_whatsapp: bool, customer_phone_db: str, system_phone_db: str
-    ) -> Response:
+    ) -> None:
         """Handle messages from contractors (commands)"""
         logger.info(f"✅ CONTRACTOR IDENTIFIED: {contractor.name} (ID: {contractor.id})")
 
@@ -97,7 +97,7 @@ class MessageWebhookHandler:
                 )
                 if takeover_response:
                     send_message(from_phone_clean, takeover_response, is_whatsapp)
-                    return Response(status_code=204)
+                    return
 
                 # Handle reach out command
                 reach_out_response = await self.command_handler.handle_reach_out_command(
@@ -105,17 +105,15 @@ class MessageWebhookHandler:
                 )
                 if reach_out_response:
                     send_message(from_phone_clean, reach_out_response, is_whatsapp)
-                    return Response(status_code=204)
+                    return
 
             # No recognized command - default contractor response
-            return Response(status_code=204)
-
-        return Response(status_code=204)
+            return
 
     async def handle_customer_message(
         self, from_phone_clean: str, body: str, is_whatsapp: bool,
         customer_phone_db: str, system_phone_db: str
-    ) -> Response:
+    ) -> None:
         """Handle messages from customers"""
         logger.info(f"👤 CUSTOMER MESSAGE from: {customer_phone_db}")
 
@@ -130,8 +128,6 @@ class MessageWebhookHandler:
         # This is where we would continue with the customer qualification flow
         # For now, let's just log it and return success
         logger.info("📋 Customer qualification flow - to be implemented")
-
-        return Response(status_code=204)
 
     async def handle_takeover_command(self, body: str, contractor) -> str | None:
         """Handle contractor takeover commands"""
